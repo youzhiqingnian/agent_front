@@ -1,0 +1,51 @@
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --bg: #f4f6fb;
+  --card: #ffffff;
+  --ink: #1c2333;
+  --ink-soft: #6b7488;
+  --line: #e4e8f1;
+  --brand: #4f6df5;
+  --brand-dark: #3b56d4;
+  --ok: #16a34a;
+  --warn: #d97706;
+  --bad: #dc2626;
+  --radius: 16px;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--ink);
+  background:
+    radial-gradient(1100px 520px at 12% -10%, #e3e9ff 0%, transparent 60%),
+    radial-gradient(900px 480px at 95% 0%, #ffe9f0 0%, transparent 55%),
+    var(--bg);
+}
+
+#app {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 40px 20px 72px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(28, 35, 51, 0.07);
+  padding: 28px;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+input {
+  font-family: inherit;
+}
