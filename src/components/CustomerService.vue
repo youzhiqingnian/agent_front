@@ -9,6 +9,8 @@ const AGENT_LABELS = {
   product_agent: '商品咨询',
   aftersale_agent: '售后专员',
   chitchat_agent: '通用客服',
+  security_guard: '安全风控',
+  clarification_agent: '信息澄清',
 }
 
 const MODE_LABELS = {
@@ -112,7 +114,15 @@ function toggleTrace(index) {
 }
 
 function agentLabel(agent) {
-  return AGENT_LABELS[agent] || agent || '客服'
+  if (!agent) return '客服'
+  if (AGENT_LABELS[agent]) return AGENT_LABELS[agent]
+  if (agent.includes(',')) {
+    return agent
+      .split(',')
+      .map((a) => AGENT_LABELS[a.trim()] || a.trim())
+      .join(' & ')
+  }
+  return agent
 }
 
 function modeLabel(mode) {
@@ -139,7 +149,7 @@ onMounted(scrollToBottom)
         <div class="bubble">
           <p class="text">{{ m.content }}</p>
           <div v-if="m.role === 'assistant' && (m.agent || m.mode)" class="meta-line">
-            <span class="agent-chip">{{ agentLabel(m.agent) }}</span>
+            <span class="agent-chip" :class="{ 'security-chip': m.agent === 'security_guard', 'clarification-chip': m.agent === 'clarification_agent' }">{{ agentLabel(m.agent) }}</span>
             <span v-if="m.mode" class="mode-chip">{{ modeLabel(m.mode) }}</span>
           </div>
           <div v-if="m.role === 'assistant' && m.trace?.length" class="trace-block">
@@ -286,6 +296,18 @@ onMounted(scrollToBottom)
   background: #e6eaff;
   border-radius: 999px;
   padding: 2px 10px;
+}
+
+.agent-chip.security-chip {
+  color: #b91c1c;
+  background: #fee2e2;
+  border: 1px solid #fca5a5;
+}
+
+.agent-chip.clarification-chip {
+  color: #b45309;
+  background: #fef3c7;
+  border: 1px solid #fde68a;
 }
 
 .mode-chip {
