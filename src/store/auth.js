@@ -49,6 +49,11 @@ export const authStore = {
     state.showAuthModal = true
   },
 
+  switchTab(tab) {
+    state.modalTab = tab
+    state.error = ''
+  },
+
   closeModal() {
     state.showAuthModal = false
     state.error = ''
@@ -106,7 +111,9 @@ export const authStore = {
     } finally {
       state.token = ''
       state.user = null
+      state.modalTab = 'login'
       state.showProfileModal = false
+      state.showAuthModal = false
       clearLocalAuth()
     }
   },

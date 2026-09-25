@@ -1,12 +1,12 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import { fetchUserLoginLogs } from '../api'
 import { authStore } from '../store/auth'
 
 const logs = ref([])
 const loadingLogs = ref(false)
 
-onMounted(async () => {
+async function loadLogs() {
   if (authStore.isAuthenticated.value) {
     loadingLogs.value = true
     try {
@@ -17,7 +17,20 @@ onMounted(async () => {
       loadingLogs.value = false
     }
   }
+}
+
+onMounted(() => {
+  loadLogs()
 })
+
+watch(
+  () => authStore.state.showProfileModal,
+  (val) => {
+    if (val) {
+      loadLogs()
+    }
+  }
+)
 </script>
 
 <template>

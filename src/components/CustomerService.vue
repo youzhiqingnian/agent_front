@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { chatWithCs } from '../api'
+import { chatWithCs, clearCsCache, fetchCsCacheStats } from '../api'
 
 const STORAGE_KEY = 'cs-chat-session'
 
@@ -11,12 +11,16 @@ const AGENT_LABELS = {
   chitchat_agent: '通用客服',
   security_guard: '安全风控',
   clarification_agent: '信息澄清',
+  semantic_cache: '⚡ 语义缓存',
 }
 
 const MODE_LABELS = {
   llm: '大模型',
   rule: '规则兜底',
+  cache: '⚡ 缓存命中',
 }
+
+const cacheStats = ref(null)
 
 const messages = ref([])
 const conversationId = ref('')
@@ -102,7 +106,30 @@ async function send() {
   } finally {
     sending.value = false
     scrollToBottom()
+    refreshCacheStats()
   }
+}
+
+async function refreshCacheStats() {
+  try {
+    cacheStats.value = await fetchCsCacheStats()
+  } catch {
+    // 忽略异常
+  }
+}
+
+async function handleClearCache() {
+  if (!confirm('确定要清空 Redis 语义缓存吗？清空后将重新从大模型问答沉淀。')) return
+  try {
+    await clearCsCache()
+    await refreshCacheStats()
+  } catch (e) {
+    alert(e.message || '清空缓存失败')
+  }
+}
+
+function usePrompt(text) {
+  input.value = text
 }
 
 function onSubmit() {
@@ -131,7 +158,10 @@ function modeLabel(mode) {
 
 watch([messages, conversationId], saveSession, { deep: true })
 
-onMounted(scrollToBottom)
+onMounted(() => {
+  scrollToBottom()
+  refreshCacheStats()
+})
 </script>
 
 <template>
@@ -139,9 +169,18 @@ onMounted(scrollToBottom)
     <header class="cs-head">
       <div>
         <h2 class="cs-title">智能客服</h2>
-        <p class="cs-sub">LangGraph 多 Agent · Supervisor 分派</p>
+        <p class="cs-sub">LangGraph 多 Agent · Supervisor 分派 · Redis 语义缓存</p>
       </div>
-      <button class="reset-btn" type="button" @click="resetSession">新会话</button>
+      <div class="head-actions">
+        <div v-if="cacheStats && cacheStats.connected" class="cache-stat-pill" :title="'Redis 地址: ' + cacheStats.redis_host + ':' + cacheStats.redis_port + ' | 相似度阈值: ' + cacheStats.similarity_threshold">
+          <span class="cache-stat-dot"></span>
+          <span>⚡ 语义缓存: {{ cacheStats.total_cached }}条已存</span>
+          <span class="cache-stat-divider">·</span>
+          <span>命中 {{ cacheStats.hits }} 次</span>
+          <button class="cache-clear-link" type="button" title="清空语义缓存数据" @click="handleClearCache">清空</button>
+        </div>
+        <button class="reset-btn" type="button" @click="resetSession">新会话</button>
+      </div>
     </header>
 
     <div ref="listEl" class="chat-list">
@@ -149,8 +188,23 @@ onMounted(scrollToBottom)
         <div class="bubble">
           <p class="text">{{ m.content }}</p>
           <div v-if="m.role === 'assistant' && (m.agent || m.mode)" class="meta-line">
-            <span class="agent-chip" :class="{ 'security-chip': m.agent === 'security_guard', 'clarification-chip': m.agent === 'clarification_agent' }">{{ agentLabel(m.agent) }}</span>
-            <span v-if="m.mode" class="mode-chip">{{ modeLabel(m.mode) }}</span>
+            <span
+              class="agent-chip"
+              :class="{
+                'security-chip': m.agent === 'security_guard',
+                'clarification-chip': m.agent === 'clarification_agent',
+                'cache-chip': m.agent === 'semantic_cache',
+              }"
+            >
+              {{ agentLabel(m.agent) }}
+            </span>
+            <span
+              v-if="m.mode"
+              class="mode-chip"
+              :class="{ 'cache-mode': m.mode === 'cache' }"
+            >
+              {{ modeLabel(m.mode) }}
+            </span>
           </div>
           <div v-if="m.role === 'assistant' && m.trace?.length" class="trace-block">
             <button class="trace-toggle" type="button" @click="toggleTrace(index)">
@@ -170,6 +224,20 @@ onMounted(scrollToBottom)
       </div>
     </div>
 
+    <!-- 语义缓存推荐提问与测试快捷气泡 -->
+    <div class="quick-prompts">
+      <span class="prompt-hint">💡 语义缓存推荐测试：</span>
+      <button type="button" class="prompt-chip" @click="usePrompt('请问易学商城购买商品后如何申请开具发票？')">
+        1. 发票申请 (首问·写入缓存)
+      </button>
+      <button type="button" class="prompt-chip" @click="usePrompt('在商城买完东西之后怎么开发票？')">
+        2. 发票咨询 (相似提问·秒级命中)
+      </button>
+      <button type="button" class="prompt-chip" @click="usePrompt('请问商城的退换货流程和运费政策是怎样的？')">
+        3. 退换货政策
+      </button>
+    </div>
+
     <p v-if="error" class="error-banner">{{ error }}</p>
 
     <form class="input-form" @submit.prevent="onSubmit">
@@ -178,7 +246,7 @@ onMounted(scrollToBottom)
         class="chat-input"
         type="text"
         autocomplete="off"
-        placeholder="输入您的问题，例如：我的订单到哪了？"
+        placeholder="输入您的问题，例如：发票怎么开？我的订单到哪了？"
         :disabled="sending"
         @compositionstart="composing = true"
         @compositionend="composing = false"
@@ -206,6 +274,53 @@ onMounted(scrollToBottom)
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cache-stat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  color: #166534;
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-weight: 500;
+}
+
+.cache-stat-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #16a34a;
+  box-shadow: 0 0 6px #16a34a;
+}
+
+.cache-stat-divider {
+  opacity: 0.35;
+}
+
+.cache-clear-link {
+  border: none;
+  background: transparent;
+  color: #b91c1c;
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 11px;
+  text-decoration: underline;
+  opacity: 0.75;
+}
+
+.cache-clear-link:hover {
+  opacity: 1;
 }
 
 .cs-title {
@@ -310,12 +425,25 @@ onMounted(scrollToBottom)
   border: 1px solid #fde68a;
 }
 
+.agent-chip.cache-chip {
+  color: #047857;
+  background: #d1fae5;
+  border: 1px solid #6ee7b7;
+}
+
 .mode-chip {
   font-size: 11.5px;
   color: var(--ink-soft);
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 1.5px 10px;
+}
+
+.mode-chip.cache-mode {
+  color: #047857;
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+  font-weight: 600;
 }
 
 .typing {
@@ -364,10 +492,47 @@ onMounted(scrollToBottom)
   border-radius: 10px;
 }
 
+.quick-prompts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 8px 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+}
+
+.prompt-hint {
+  font-size: 12px;
+  color: #64748b;
+  font-weight: 600;
+}
+
+.prompt-chip {
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #334155;
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.prompt-chip:hover {
+  background: #eef2ff;
+  border-color: #818cf8;
+  color: var(--brand);
+  transform: translateY(-1px);
+}
+
 .input-form {
   display: flex;
   gap: 10px;
-  margin-top: 14px;
+  margin-top: 10px;
 }
 
 .chat-input {
