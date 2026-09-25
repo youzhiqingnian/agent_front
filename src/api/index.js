@@ -166,3 +166,46 @@ export async function uploadKbDocument(formData) {
   }
   return response.json()
 }
+
+// ===== 电商与商品中心 API =====
+
+export const fetchEcommerceCategories = () => request('/api/ecommerce/categories')
+
+export const fetchEcommerceBrands = () => request('/api/ecommerce/brands')
+
+export const fetchEcommerceProducts = (params = {}) => {
+  const query = new URLSearchParams()
+  if (params.category_id) query.append('category_id', params.category_id)
+  if (params.keyword) query.append('keyword', params.keyword)
+  if (params.is_hot !== undefined && params.is_hot !== null && params.is_hot !== '') {
+    query.append('is_hot', params.is_hot)
+  }
+  const qs = query.toString() ? `?${query.toString()}` : ''
+  return request(`/api/ecommerce/products${qs}`)
+}
+
+export const fetchProductDetail = (productId) => request(`/api/ecommerce/products/${productId}`)
+
+export const fetchUserAddresses = (userId) => {
+  const qs = userId ? `?user_id=${userId}` : ''
+  return request(`/api/ecommerce/addresses${qs}`)
+}
+
+export const createOrder = (payload) =>
+  request('/api/ecommerce/orders/create', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+
+export const fetchUserOrders = (userId, orderStatus) => {
+  const query = new URLSearchParams()
+  if (userId) query.append('user_id', userId)
+  if (orderStatus !== undefined && orderStatus !== null && orderStatus !== '') {
+    query.append('order_status', orderStatus)
+  }
+  const qs = query.toString() ? `?${query.toString()}` : ''
+  return request(`/api/ecommerce/orders${qs}`)
+}
+
+export const fetchOrderDetail = (orderNo) => request(`/api/ecommerce/orders/${encodeURIComponent(orderNo)}`)
+

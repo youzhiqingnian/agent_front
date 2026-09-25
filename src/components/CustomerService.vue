@@ -14,6 +14,7 @@ import { authStore } from '../store/auth'
 const STORAGE_KEY = 'cs-chat-session'
 
 const AGENT_LABELS = {
+  text_to_sql_agent: '📊 数据查询专员',
   order_agent: '订单专员',
   product_agent: '商品咨询',
   aftersale_agent: '售后专员',
@@ -24,6 +25,7 @@ const AGENT_LABELS = {
 }
 
 const MODE_LABELS = {
+  sql: '📊 SQL直查汇总',
   llm: '大模型',
   rule: '规则兜底',
   cache: '⚡ 缓存命中',
@@ -279,7 +281,7 @@ onMounted(() => {
     <header class="cs-head">
       <div>
         <h2 class="cs-title">智能客服</h2>
-        <p class="cs-sub">LangGraph 多 Agent · Supervisor 分派 · 个人问答隔离记录 · Redis 语义缓存</p>
+        <p class="cs-sub">LangGraph 多 Agent · Mem0 长期记忆 (user_id 隔离) · Text-to-SQL · Redis 语义缓存</p>
       </div>
       <div class="head-actions">
         <div v-if="cacheStats && cacheStats.connected" class="cache-stat-pill" :title="'Redis 地址: ' + cacheStats.redis_host + ':' + cacheStats.redis_port + ' | 相似度阈值: ' + cacheStats.similarity_threshold">
@@ -334,6 +336,7 @@ onMounted(() => {
                 'security-chip': m.agent === 'security_guard',
                 'clarification-chip': m.agent === 'clarification_agent',
                 'cache-chip': m.agent === 'semantic_cache',
+                'sql-chip': m.agent === 'text_to_sql_agent',
               }"
             >
               {{ agentLabel(m.agent) }}
@@ -341,7 +344,7 @@ onMounted(() => {
             <span
               v-if="m.mode"
               class="mode-chip"
-              :class="{ 'cache-mode': m.mode === 'cache' }"
+              :class="{ 'cache-mode': m.mode === 'cache', 'sql-mode': m.mode === 'sql' }"
             >
               {{ modeLabel(m.mode) }}
             </span>
@@ -364,7 +367,7 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- 语义缓存推荐提问与测试快捷气泡 -->
+    <!-- 语义缓存与 Text-to-SQL 推荐提问测试快捷气泡 -->
     <div class="quick-prompts">
       <span class="prompt-hint">💡 推荐提问测试：</span>
       <button type="button" class="prompt-chip" @click="usePrompt('请问易学商城购买商品后如何申请开具发票？')">
@@ -375,6 +378,12 @@ onMounted(() => {
       </button>
       <button type="button" class="prompt-chip" @click="usePrompt('请问商城的退换货流程和运费政策是怎样的？')">
         3. 退换货政策
+      </button>
+      <button type="button" class="prompt-chip sql-chip-btn" @click="usePrompt('陈小明 买过899的商品')">
+        4. 🔍 Text-to-SQL (陈小明 买过899的商品)
+      </button>
+      <button type="button" class="prompt-chip sql-chip-btn" @click="usePrompt('我都买过什么商品？')">
+        5. 👤 个人购买 (我都买过什么商品？)
       </button>
     </div>
 
@@ -696,6 +705,12 @@ onMounted(() => {
   border: 1px solid #6ee7b7;
 }
 
+.agent-chip.sql-chip {
+  color: #0369a1;
+  background: #e0f2fe;
+  border: 1px solid #7dd3fc;
+}
+
 .mode-chip {
   font-size: 11.5px;
   color: var(--ink-soft);
@@ -708,6 +723,13 @@ onMounted(() => {
   color: #047857;
   background: #ecfdf5;
   border-color: #a7f3d0;
+  font-weight: 600;
+}
+
+.mode-chip.sql-mode {
+  color: #0284c7;
+  background: #f0f9ff;
+  border-color: #bae6fd;
   font-weight: 600;
 }
 
@@ -792,6 +814,19 @@ onMounted(() => {
   border-color: #818cf8;
   color: var(--brand);
   transform: translateY(-1px);
+}
+
+.prompt-chip.sql-chip-btn {
+  background: #f0fdf4;
+  border-color: #86efac;
+  color: #15803d;
+  font-weight: 600;
+}
+
+.prompt-chip.sql-chip-btn:hover {
+  background: #dcfce7;
+  border-color: #4ade80;
+  color: #166534;
 }
 
 .input-form {
@@ -1348,6 +1383,11 @@ onMounted(() => {
 .agent-tag.semantic_cache {
   background: #d1fae5;
   color: #065f46;
+}
+
+.agent-tag.text_to_sql_agent {
+  background: #e0f2fe;
+  color: #0369a1;
 }
 
 .agent-tag.security_guard {

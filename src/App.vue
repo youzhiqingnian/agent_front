@@ -4,12 +4,13 @@ import WordCard from './components/WordCard.vue'
 import JudgeResult from './components/JudgeResult.vue'
 import CustomerService from './components/CustomerService.vue'
 import KnowledgeBase from './components/KnowledgeBase.vue'
+import ProductMall from './components/ProductMall.vue'
 import AuthScreen from './components/AuthScreen.vue'
 import UserProfileModal from './components/UserProfileModal.vue'
 import { fetchCurrentWord, fetchHealth, submitJudge } from './api'
 import { authStore } from './store/auth'
 
-const view = ref('kb')
+const view = ref('mall')
 const card = ref(null)
 const health = ref(null)
 const result = ref(null)
@@ -117,6 +118,9 @@ async function handleSubmit(answer) {
     <p v-if="loadError" class="error-banner">{{ loadError }}</p>
 
     <nav class="tabs">
+      <button class="tab" :class="{ active: view === 'mall' }" type="button" @click="view = 'mall'">
+        🛍️ 商品展示
+      </button>
       <button class="tab" :class="{ active: view === 'kb' }" type="button" @click="view = 'kb'">
         🧠 RAG 知识库
       </button>
@@ -129,7 +133,9 @@ async function handleSubmit(answer) {
     </nav>
 
     <!-- 各功能模块视图 -->
-    <KnowledgeBase v-if="view === 'kb'" />
+    <ProductMall v-if="view === 'mall'" @switch-view="(v) => view = v" />
+
+    <KnowledgeBase v-else-if="view === 'kb'" />
 
     <CustomerService v-else-if="view === 'cs'" />
 
