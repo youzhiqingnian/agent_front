@@ -101,6 +101,29 @@ export const clearCsCache = () =>
     method: 'POST',
   })
 
+// 用户问答历史 API (按登录账号隔离)
+export const fetchUserQaHistory = (params = {}) => {
+  const query = new URLSearchParams()
+  if (params.conversation_id) query.append('conversation_id', params.conversation_id)
+  if (params.keyword) query.append('keyword', params.keyword)
+  if (params.limit) query.append('limit', params.limit)
+  if (params.offset) query.append('offset', params.offset)
+  const qs = query.toString() ? `?${query.toString()}` : ''
+  return request(`/api/cs/history${qs}`)
+}
+
+export const fetchUserQaSessions = () => request('/api/cs/sessions')
+
+export const deleteUserQaRecord = (recordId) =>
+  request(`/api/cs/history/${recordId}`, {
+    method: 'DELETE',
+  })
+
+export const clearUserQaHistory = () =>
+  request('/api/cs/history/clear', {
+    method: 'POST',
+  })
+
 // ===== RAG 知识库 API =====
 
 export const fetchKbStatus = () => request('/api/kb/status')

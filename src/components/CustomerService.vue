@@ -1,6 +1,15 @@
 <script setup>
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { chatWithCs, clearCsCache, fetchCsCacheStats } from '../api'
+import {
+  chatWithCs,
+  clearCsCache,
+  clearUserQaHistory,
+  deleteUserQaRecord,
+  fetchCsCacheStats,
+  fetchUserQaHistory,
+  fetchUserQaSessions,
+} from '../api'
+import { authStore } from '../store/auth'
 
 const STORAGE_KEY = 'cs-chat-session'
 
@@ -30,6 +39,15 @@ const composing = ref(false)
 const error = ref('')
 const listEl = ref(null)
 const openTrace = ref(-1)
+
+// 个人历史问答弹窗相关状态（按登录账号完全隔离）
+const showHistoryModal = ref(false)
+const historyLoading = ref(false)
+const historyRecords = ref([])
+const historyTotal = ref(0)
+const historyKeyword = ref('')
+const userSessions = ref([])
+const selectedSessionId = ref('')
 
 const canSend = computed(() => !sending.value)
 
@@ -107,6 +125,9 @@ async function send() {
     sending.value = false
     scrollToBottom()
     refreshCacheStats()
+    if (authStore.isAuthenticated.value) {
+      loadHistoryData()
+    }
   }
 }
 
@@ -126,6 +147,78 @@ async function handleClearCache() {
   } catch (e) {
     alert(e.message || '清空缓存失败')
   }
+}
+
+// ===== 个人历史问答业务处理 =====
+
+async function openHistory() {
+  if (!authStore.isAuthenticated.value) {
+    authStore.openLogin()
+    return
+  }
+  showHistoryModal.value = true
+  await loadHistoryData()
+}
+
+async function loadHistoryData() {
+  if (!authStore.isAuthenticated.value) {
+    historyRecords.value = []
+    historyTotal.value = 0
+    userSessions.value = []
+    return
+  }
+  historyLoading.value = true
+  try {
+    const res = await fetchUserQaHistory({
+      keyword: historyKeyword.value.trim(),
+      conversation_id: selectedSessionId.value,
+    })
+    historyRecords.value = res.items || []
+    historyTotal.value = res.total || 0
+
+    // 同时拉取会话分组
+    const sessions = await fetchUserQaSessions()
+    userSessions.value = sessions || []
+  } catch (err) {
+    console.error('获取个人历史问答失败:', err)
+  } finally {
+    historyLoading.value = false
+  }
+}
+
+async function handleDeleteHistoryItem(id) {
+  if (!confirm('确定要删除这条提问与解答记录吗？')) return
+  try {
+    await deleteUserQaRecord(id)
+    await loadHistoryData()
+  } catch (err) {
+    alert(err.message || '删除记录失败')
+  }
+}
+
+async function handleClearAllUserHistory() {
+  if (!confirm('确定要清空您在此账号下的所有提问与解答记录吗？此操作不可恢复。')) return
+  try {
+    await clearUserQaHistory()
+    await loadHistoryData()
+  } catch (err) {
+    alert(err.message || '清空记录失败')
+  }
+}
+
+function handleUseSession(item) {
+  conversationId.value = item.conversation_id
+  showHistoryModal.value = false
+  input.value = ''
+  // 将焦点对准输入框
+  nextTick(() => {
+    scrollToBottom()
+  })
+}
+
+function filterBySession(cid) {
+  selectedSessionId.value = selectedSessionId.value === cid ? '' : cid
+  loadHistoryData()
 }
 
 function usePrompt(text) {
@@ -158,9 +251,26 @@ function modeLabel(mode) {
 
 watch([messages, conversationId], saveSession, { deep: true })
 
+watch(
+  () => authStore.isAuthenticated.value,
+  (isAuth) => {
+    if (isAuth) {
+      loadHistoryData()
+    } else {
+      historyRecords.value = []
+      historyTotal.value = 0
+      userSessions.value = []
+    }
+  },
+  { immediate: true },
+)
+
 onMounted(() => {
   scrollToBottom()
   refreshCacheStats()
+  if (authStore.isAuthenticated.value) {
+    loadHistoryData()
+  }
 })
 </script>
 
@@ -169,7 +279,7 @@ onMounted(() => {
     <header class="cs-head">
       <div>
         <h2 class="cs-title">智能客服</h2>
-        <p class="cs-sub">LangGraph 多 Agent · Supervisor 分派 · Redis 语义缓存</p>
+        <p class="cs-sub">LangGraph 多 Agent · Supervisor 分派 · 个人问答隔离记录 · Redis 语义缓存</p>
       </div>
       <div class="head-actions">
         <div v-if="cacheStats && cacheStats.connected" class="cache-stat-pill" :title="'Redis 地址: ' + cacheStats.redis_host + ':' + cacheStats.redis_port + ' | 相似度阈值: ' + cacheStats.similarity_threshold">
@@ -179,9 +289,39 @@ onMounted(() => {
           <span>命中 {{ cacheStats.hits }} 次</span>
           <button class="cache-clear-link" type="button" title="清空语义缓存数据" @click="handleClearCache">清空</button>
         </div>
+
+        <!-- 我的提问记录按钮 (登录用户专属) -->
+        <button
+          class="history-btn"
+          type="button"
+          :title="authStore.isAuthenticated.value ? '查看我的专属智能问答记录' : '登录后查看我的提问记录'"
+          @click="openHistory"
+        >
+          📜 我的提问
+          <span v-if="authStore.isAuthenticated.value && historyTotal > 0" class="history-count-badge">
+            {{ historyTotal }}
+          </span>
+        </button>
+
         <button class="reset-btn" type="button" @click="resetSession">新会话</button>
       </div>
     </header>
+
+    <!-- 用户登录状态提示条 -->
+    <div v-if="authStore.isAuthenticated.value" class="user-status-bar logged-in">
+      <span class="user-status-icon">👤</span>
+      <span class="user-status-text">
+        登录账号：<strong>{{ authStore.currentUser.value?.nickname || authStore.currentUser.value?.username }}</strong>
+        <span class="role-tag">{{ authStore.currentUser.value?.role === 'admin' ? '管理员' : '学员' }}</span>
+        · 已记录 <strong>{{ historyTotal }}</strong> 次专属问答
+      </span>
+      <button class="view-history-link" type="button" @click="openHistory">查看我的问答明细 →</button>
+    </div>
+    <div v-else class="user-status-bar guest">
+      <span class="user-status-icon">💡</span>
+      <span class="user-status-text">当前处于游客模式，提问仅保存在本地临时缓存中。</span>
+      <button class="login-prompt-btn" type="button" @click="authStore.openLogin">登录账号云端保存记录</button>
+    </div>
 
     <div ref="listEl" class="chat-list">
       <div v-for="(m, index) in messages" :key="index" class="row" :class="m.role">
@@ -226,7 +366,7 @@ onMounted(() => {
 
     <!-- 语义缓存推荐提问与测试快捷气泡 -->
     <div class="quick-prompts">
-      <span class="prompt-hint">💡 语义缓存推荐测试：</span>
+      <span class="prompt-hint">💡 推荐提问测试：</span>
       <button type="button" class="prompt-chip" @click="usePrompt('请问易学商城购买商品后如何申请开具发票？')">
         1. 发票申请 (首问·写入缓存)
       </button>
@@ -256,6 +396,131 @@ onMounted(() => {
         {{ sending ? '回复中…' : '发送' }}
       </button>
     </form>
+
+    <!-- 我的提问与解答记录抽屉/弹窗 (按登录用户完全隔离) -->
+    <Teleport to="body">
+      <div v-if="showHistoryModal" class="modal-backdrop" @click.self="showHistoryModal = false">
+        <div class="modal-card history-modal">
+          <header class="modal-head">
+            <div class="modal-title-wrap">
+              <h3 class="modal-title">📜 我的专属智能问答记录</h3>
+              <p class="modal-sub">
+                账号：<strong>{{ authStore.currentUser.value?.nickname || authStore.currentUser.value?.username }}</strong>
+                · 共记录 <strong>{{ historyTotal }}</strong> 次问答（独立隔离保存）
+              </p>
+            </div>
+            <button class="close-btn" type="button" @click="showHistoryModal = false">✕</button>
+          </header>
+
+          <div class="modal-body history-body">
+            <!-- 搜索与筛选工具栏 -->
+            <div class="history-toolbar">
+              <div class="search-box">
+                <input
+                  v-model="historyKeyword"
+                  type="text"
+                  placeholder="搜索我问过的问题或解答关键词..."
+                  class="search-input"
+                  @keyup.enter="loadHistoryData"
+                />
+                <button type="button" class="search-btn" @click="loadHistoryData">搜索</button>
+              </div>
+              <div class="history-actions">
+                <button type="button" class="tool-btn refresh-btn" @click="loadHistoryData">🔄 刷新</button>
+                <button v-if="historyTotal > 0" type="button" class="tool-btn clear-btn" @click="handleClearAllUserHistory">🗑️ 清空所有记录</button>
+              </div>
+            </div>
+
+            <!-- 会话筛选标签 (若有多个会话) -->
+            <div v-if="userSessions.length > 1" class="session-filter-chips">
+              <span class="filter-label">会话筛选:</span>
+              <button
+                type="button"
+                class="session-chip"
+                :class="{ active: !selectedSessionId }"
+                @click="filterBySession('')"
+              >
+                全部会话
+              </button>
+              <button
+                v-for="sess in userSessions"
+                :key="sess.conversation_id"
+                type="button"
+                class="session-chip"
+                :class="{ active: selectedSessionId === sess.conversation_id }"
+                @click="filterBySession(sess.conversation_id)"
+              >
+                {{ sess.first_question }} ({{ sess.total_qas }}条)
+              </button>
+            </div>
+
+            <!-- 加载状态 -->
+            <div v-if="historyLoading" class="loading-state">
+              <span class="spinner dark"></span>
+              <span>正在获取您的历史问答记录...</span>
+            </div>
+
+            <!-- 空状态 -->
+            <div v-else-if="!historyRecords.length" class="empty-state">
+              <div class="empty-icon">📭</div>
+              <p class="empty-title">暂无提问记录</p>
+              <p class="empty-desc">
+                {{ historyKeyword ? '没有找到包含该关键字的问答' : '您在此账号下尚未向智能客服提问过，快去咨询吧～' }}
+              </p>
+            </div>
+
+            <!-- 问答记录卡片列表 -->
+            <div v-else class="history-list">
+              <div v-for="item in historyRecords" :key="item.id" class="history-card">
+                <div class="history-card-header">
+                  <div class="card-meta">
+                    <span class="time-tag">🕒 {{ item.created_at }}</span>
+                    <span class="agent-tag" :class="item.agent">{{ agentLabel(item.agent) }}</span>
+                    <span class="mode-tag">{{ modeLabel(item.mode) }}</span>
+                  </div>
+                  <div class="card-ops">
+                    <button
+                      type="button"
+                      class="op-btn use-session-btn"
+                      title="切换到当前会话继续提问"
+                      @click="handleUseSession(item)"
+                    >
+                      继续提问 ↗
+                    </button>
+                    <button
+                      type="button"
+                      class="op-btn delete-btn"
+                      title="删除此条记录"
+                      @click="handleDeleteHistoryItem(item.id)"
+                    >
+                      🗑️
+                    </button>
+                  </div>
+                </div>
+
+                <div class="history-qa-content">
+                  <div class="qa-item question-row">
+                    <span class="qa-badge q-badge">问</span>
+                    <div class="qa-bubble q-bubble">
+                      <p class="qa-text">{{ item.question }}</p>
+                    </div>
+                  </div>
+                  <div class="qa-item answer-row">
+                    <span class="qa-badge a-badge">答</span>
+                    <div class="qa-bubble a-bubble">
+                      <p class="qa-text">{{ item.answer }}</p>
+                      <div v-if="item.trace_summary" class="trace-summary-pill">
+                        流程追踪: {{ item.trace_summary }}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </section>
 </template>
 
@@ -643,5 +908,572 @@ onMounted(() => {
   .send-btn {
     justify-content: center;
   }
+}
+
+/* 历史问答按钮 & 徽标 */
+.history-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: #3b82f6;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.history-btn:hover {
+  background: #dbeafe;
+  color: #1d4ed8;
+  transform: translateY(-1px);
+}
+
+.history-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #2563eb;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  line-height: 1;
+}
+
+/* 用户状态提示条 */
+.user-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.user-status-bar.logged-in {
+  background: #f0f7ff;
+  border: 1px solid #c7dcfb;
+  color: #1e3a8a;
+}
+
+.user-status-bar.guest {
+  background: #fefce8;
+  border: 1px solid #fef08a;
+  color: #854d0e;
+}
+
+.user-status-icon {
+  font-size: 14px;
+}
+
+.user-status-text {
+  flex: 1;
+}
+
+.role-tag {
+  display: inline-block;
+  font-size: 11px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 4px;
+  font-weight: 600;
+}
+
+.view-history-link {
+  border: none;
+  background: transparent;
+  color: #2563eb;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  transition: text-decoration 0.15s;
+}
+
+.view-history-link:hover {
+  text-decoration: underline;
+}
+
+.login-prompt-btn {
+  border: none;
+  background: #eab308;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.login-prompt-btn:hover {
+  background: #ca8a04;
+}
+
+/* 历史记录抽屉 / 弹窗 */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 16px;
+  animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.history-modal {
+  position: relative;
+  width: 100%;
+  max-width: 800px;
+  max-height: 85vh;
+  background: #ffffff;
+  border-radius: 20px;
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: slideUp 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(20px) scale(0.98);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
+}
+
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid #f1f5f9;
+  background: #fafbfc;
+}
+
+.modal-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.modal-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.modal-sub {
+  margin: 0;
+  font-size: 12.5px;
+  color: #64748b;
+}
+
+.modal-sub strong {
+  color: #3b82f6;
+}
+
+.close-btn {
+  border: none;
+  background: #f1f5f9;
+  color: #64748b;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.close-btn:hover {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+.history-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 24px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* 工具栏 */
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.search-box {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 240px;
+  border: 1.5px solid #e2e8f0;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #fff;
+  transition: border-color 0.15s;
+}
+
+.search-box:focus-within {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.12);
+}
+
+.search-input {
+  flex: 1;
+  border: none;
+  padding: 8px 12px;
+  font-size: 13.5px;
+  outline: none;
+  color: #1e293b;
+}
+
+.search-btn {
+  border: none;
+  background: #f1f5f9;
+  color: #475569;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.search-btn:hover {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+
+.history-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tool-btn {
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  font-size: 12.5px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.15s;
+  color: #475569;
+}
+
+.tool-btn:hover {
+  background: #f8fafc;
+  border-color: #cbd5e1;
+}
+
+.clear-btn {
+  color: #dc2626;
+  border-color: #fecaca;
+  background: #fef2f2;
+}
+
+.clear-btn:hover {
+  background: #fee2e2;
+  border-color: #fca5a5;
+}
+
+/* 会话筛选 */
+.session-filter-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.filter-label {
+  font-size: 12px;
+  color: #64748b;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.session-chip {
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #475569;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+  max-width: 220px;
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+
+.session-chip:hover {
+  background: #edf2f7;
+  border-color: #cbd5e1;
+}
+
+.session-chip.active {
+  background: #eff6ff;
+  border-color: #3b82f6;
+  color: #1d4ed8;
+  font-weight: 600;
+}
+
+/* 加载 & 空状态 */
+.loading-state,
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 16px;
+  text-align: center;
+}
+
+.loading-state {
+  gap: 12px;
+  color: #64748b;
+  font-size: 14px;
+}
+
+.spinner.dark {
+  border-color: rgba(59, 130, 246, 0.2);
+  border-top-color: #3b82f6;
+}
+
+.empty-icon {
+  font-size: 40px;
+  margin-bottom: 8px;
+}
+
+.empty-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #334155;
+}
+
+.empty-desc {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+/* 记录卡片列表 */
+.history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.history-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  background: #ffffff;
+  padding: 14px 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  transition: box-shadow 0.15s, border-color 0.15s;
+}
+
+.history-card:hover {
+  border-color: #cbd5e1;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+}
+
+.history-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.card-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: #64748b;
+  flex-wrap: wrap;
+}
+
+.time-tag {
+  color: #64748b;
+}
+
+.agent-tag {
+  background: #f1f5f9;
+  color: #334155;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-weight: 500;
+}
+
+.agent-tag.semantic_cache {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.agent-tag.security_guard {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.agent-tag.clarification_agent {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.mode-tag {
+  border: 1px solid #e2e8f0;
+  color: #64748b;
+  padding: 0 6px;
+  border-radius: 4px;
+}
+
+.card-ops {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.op-btn {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+  transition: all 0.15s;
+}
+
+.use-session-btn {
+  font-size: 12px;
+  color: #2563eb;
+  font-weight: 500;
+  background: #eff6ff;
+  padding: 3px 8px;
+}
+
+.use-session-btn:hover {
+  background: #dbeafe;
+}
+
+.delete-btn {
+  font-size: 13px;
+  opacity: 0.6;
+}
+
+.delete-btn:hover {
+  opacity: 1;
+  background: #fee2e2;
+}
+
+/* 问答内容区域 */
+.history-qa-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.qa-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.qa-badge {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  margin-top: 2px;
+}
+
+.q-badge {
+  background: #3b82f6;
+  color: #ffffff;
+}
+
+.a-badge {
+  background: #10b981;
+  color: #ffffff;
+}
+
+.qa-bubble {
+  flex: 1;
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 13.5px;
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.q-bubble {
+  background: #f0f7ff;
+  color: #1e3a8a;
+  font-weight: 500;
+}
+
+.a-bubble {
+  background: #f8fafc;
+  color: #334155;
+  border: 1px solid #f1f5f9;
+}
+
+.qa-text {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.trace-summary-pill {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: #64748b;
+  background: #f1f5f9;
+  padding: 2px 8px;
+  border-radius: 6px;
+  display: inline-block;
+  font-family: 'Cascadia Code', Consolas, monospace;
 }
 </style>
