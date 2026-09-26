@@ -130,28 +130,43 @@ export async function chatWithCsStream(conversationId, message, { onThought, onT
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
 
+  const processBlock = (block) => {
+    const trimmed = block.trim()
+    if (!trimmed) return
+    const lines = trimmed.split(/\r?\n/)
+    let dataContent = ''
+    for (const line of lines) {
+      if (line.startsWith('data:')) {
+        const chunk = line.replace(/^data:\s?/, '')
+        dataContent += (dataContent ? '\n' : '') + chunk
+      }
+    }
+    if (!dataContent) return
+    try {
+      const event = JSON.parse(dataContent)
+      if (event.type === 'thought' && onThought) onThought(event)
+      else if (event.type === 'token' && onToken) onToken(event)
+      else if (event.type === 'done' && onDone) onDone(event)
+      else if (event.type === 'error' && onError) onError(event)
+    } catch (e) {
+      console.warn('Failed to parse SSE event:', e, dataContent)
+    }
+  }
+
   try {
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
       buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n\n')
-      buffer = lines.pop() || ''
+      const blocks = buffer.split(/\r?\n\r?\n/)
+      buffer = blocks.pop() || ''
 
-      for (const block of lines) {
-        const trimmed = block.trim()
-        if (!trimmed || !trimmed.startsWith('data:')) continue
-        const jsonStr = trimmed.replace(/^data:\s*/, '')
-        try {
-          const event = JSON.parse(jsonStr)
-          if (event.type === 'thought' && onThought) onThought(event)
-          else if (event.type === 'token' && onToken) onToken(event)
-          else if (event.type === 'done' && onDone) onDone(event)
-          else if (event.type === 'error' && onError) onError(event)
-        } catch (e) {
-          console.warn('Failed to parse SSE event:', e, jsonStr)
-        }
+      for (const block of blocks) {
+        processBlock(block)
       }
+    }
+    if (buffer.trim()) {
+      processBlock(buffer)
     }
   } catch (err) {
     if (onError) onError({ message: err.message || '流式数据接收异常' })

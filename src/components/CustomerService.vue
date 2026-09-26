@@ -43,6 +43,8 @@ const error = ref('')
 const listEl = ref(null)
 const openTrace = ref(-1)
 
+let activeTypewriterTimer = null
+
 // 个人历史问答弹窗相关状态（按登录账号完全隔离）
 const showHistoryModal = ref(false)
 const historyLoading = ref(false)
@@ -92,6 +94,10 @@ function scrollToBottom() {
 }
 
 function resetSession() {
+  if (activeTypewriterTimer) {
+    clearInterval(activeTypewriterTimer)
+    activeTypewriterTimer = null
+  }
   localStorage.removeItem(STORAGE_KEY)
   conversationId.value = ''
   messages.value = greeting()
@@ -109,7 +115,7 @@ async function send() {
   messages.value.push({ role: 'user', content: text })
   sending.value = true
 
-  // 2. 助理气泡即刻入列（包含深度思考推理卡片）
+  // 2. 助理气泡即刻入列（包含深度思考推理卡片与平滑打字机状态）
   const assistantMsg = {
     role: 'assistant',
     content: '',
@@ -118,15 +124,75 @@ async function send() {
     trace: [],
     thoughts: [],
     thinking: true,
-    thoughtCollapsed: false, // 思考推理进行中：默认展开给用户实时感知
+    thinkingText: '',
+    thinkingTyping: false,
+    typing: false,
   }
   messages.value.push(assistantMsg)
   scrollToBottom()
 
+  // 全链路双轨打字机：思考推理流逐字向外蹦 + 回答正文逐字向外蹦 (12ms 高频时钟)
+  let thoughtCharBuffer = ''
+  let tokenBuffer = ''
+  let typewriterTimer = null
+  let isStreamDone = false
+  let pendingDoneEvt = null
+
+  const flushTypewriter = () => {
+    let hasWork = false
+
+    // 1. 驱动思考推理流逐字向外蹦 (Typewriter for Thinking stream)
+    if (thoughtCharBuffer.length > 0) {
+      hasWork = true
+      const step = thoughtCharBuffer.length > 35 ? 3 : thoughtCharBuffer.length > 15 ? 2 : 1
+      const chars = thoughtCharBuffer.slice(0, step)
+      thoughtCharBuffer = thoughtCharBuffer.slice(step)
+      assistantMsg.thinkingText += chars
+      assistantMsg.thinkingTyping = true
+    } else {
+      assistantMsg.thinkingTyping = false
+    }
+
+    // 2. 驱动回答正文逐字向外蹦 (Typewriter for Answer content)
+    if (tokenBuffer.length > 0) {
+      hasWork = true
+      const step = tokenBuffer.length > 30 ? 3 : tokenBuffer.length > 10 ? 2 : 1
+      const chars = tokenBuffer.slice(0, step)
+      tokenBuffer = tokenBuffer.slice(step)
+      assistantMsg.content += chars
+      assistantMsg.typing = true
+    }
+
+    if (hasWork) {
+      scrollToBottom()
+    } else if (isStreamDone) {
+      // 流全部结束且全部打字缓冲区均已排空
+      if (typewriterTimer) {
+        clearInterval(typewriterTimer)
+        typewriterTimer = null
+      }
+      activeTypewriterTimer = null
+      assistantMsg.thinkingTyping = false
+      assistantMsg.typing = false
+      assistantMsg.thinking = false
+      if (!assistantMsg.content && pendingDoneEvt?.reply) {
+        assistantMsg.content = pendingDoneEvt.reply
+      }
+      scrollToBottom()
+    }
+  }
+
+  const startTypewriter = () => {
+    if (!typewriterTimer) {
+      typewriterTimer = setInterval(flushTypewriter, 12)
+      activeTypewriterTimer = typewriterTimer
+    }
+  }
+
   try {
     await chatWithCsStream(conversationId.value, text, {
       onThought: (th) => {
-        // 实时更新或追加思考与推理步骤
+        // 保存 thought 结构化记录
         const existingIdx = assistantMsg.thoughts.findIndex((t) => t.node === th.node)
         if (existingIdx >= 0) {
           assistantMsg.thoughts[existingIdx] = {
@@ -143,35 +209,55 @@ async function send() {
             status: th.status,
           })
         }
+
+        // 生成思考推理流日志行并推入打字机字符队列
+        const marker = th.status === 'running' ? '▸' : '✓'
+        const detailText = th.detail ? ` — ${th.detail}` : ''
+        const line = `${marker} ${th.title}${detailText}\n`
+        thoughtCharBuffer += line
+
+        startTypewriter()
         scrollToBottom()
       },
       onToken: (tok) => {
-        // 核心体验：一旦开始输出最终回答内容，自动折叠思考推理过程（保持界面整洁干练）
+        // 首字到达：思考主要阶段已完成，开启正文打字机
         if (assistantMsg.thinking) {
           assistantMsg.thinking = false
-          assistantMsg.thoughtCollapsed = true
         }
-        assistantMsg.content += tok.content
-        scrollToBottom()
+        assistantMsg.typing = true
+        tokenBuffer += tok.content
+        startTypewriter()
       },
       onDone: (doneEvt) => {
-        assistantMsg.thinking = false
-        assistantMsg.thoughtCollapsed = true
-        if (!assistantMsg.content && doneEvt.reply) {
-          assistantMsg.content = doneEvt.reply
-        }
+        isStreamDone = true
+        pendingDoneEvt = doneEvt
         assistantMsg.agent = doneEvt.agent
         assistantMsg.mode = doneEvt.mode
         assistantMsg.trace = doneEvt.trace || []
         conversationId.value = doneEvt.conversation_id
+        startTypewriter()
       },
       onError: (errEvt) => {
         assistantMsg.thinking = false
+        assistantMsg.thinkingTyping = false
+        assistantMsg.typing = false
+        if (typewriterTimer) {
+          clearInterval(typewriterTimer)
+          typewriterTimer = null
+        }
+        activeTypewriterTimer = null
         error.value = errEvt.message || '接收回复异常'
       },
     })
   } catch (err) {
     assistantMsg.thinking = false
+    assistantMsg.thinkingTyping = false
+    assistantMsg.typing = false
+    if (typewriterTimer) {
+      clearInterval(typewriterTimer)
+      typewriterTimer = null
+    }
+    activeTypewriterTimer = null
     error.value = err.message || '消息发送失败'
     if (!assistantMsg.content) {
       assistantMsg.content = '抱歉，服务暂不可用，请稍后重试。'
@@ -305,6 +391,24 @@ function modeLabel(mode) {
   return MODE_LABELS[mode] || mode || ''
 }
 
+function latestThinkingTitle(m) {
+  if (!m || !m.thoughts || !m.thoughts.length) return ''
+  const running = m.thoughts.slice().reverse().find((t) => t.status === 'running')
+  if (running) return running.title
+  return m.thoughts[m.thoughts.length - 1].title
+}
+
+function formatThoughtsFallback(m) {
+  if (!m || !m.thoughts || !m.thoughts.length) return ''
+  return m.thoughts
+    .map((th) => {
+      const marker = th.status === 'running' ? '▸' : '✓'
+      const detailText = th.detail ? ` — ${th.detail}` : ''
+      return `${marker} ${th.title}${detailText}`
+    })
+    .join('\n')
+}
+
 watch([messages, conversationId], saveSession, { deep: true })
 
 watch(
@@ -382,68 +486,58 @@ onMounted(() => {
     <div ref="listEl" class="chat-list">
       <div v-for="(m, index) in messages" :key="index" class="row" :class="m.role">
         <div class="bubble">
-          <!-- 深度推理与思考过程卡片（可实时流式展开，回答完成后折叠） -->
+          <!-- 深度推理与思考过程卡片（永久展开，无折叠按钮，逐字打字机流式展示） -->
+          <!-- 深度思考与推理流（无折叠按钮，永久展开，打字机流式逐字输出） -->
           <div
-            v-if="m.role === 'assistant' && (m.thoughts?.length || m.thinking)"
+            v-if="m.role === 'assistant' && (m.thinkingText || m.thinking || m.thoughts?.length)"
             class="thought-card"
-            :class="{ 'is-thinking': m.thinking, 'is-collapsed': m.thoughtCollapsed }"
+            :class="{ 'is-thinking': m.thinking || m.thinkingTyping, 'is-typing': m.typing }"
           >
-            <div
-              class="thought-header"
-              :title="m.thoughtCollapsed ? '点击展开查看完整推理过程' : '点击折叠收起推理过程'"
-              @click="m.thoughtCollapsed = !m.thoughtCollapsed"
-            >
+            <div class="thought-header">
               <div class="thought-header-left">
-                <span class="thought-icon" :class="{ 'pulse-icon': m.thinking }">🧠</span>
+                <span class="thought-icon" :class="{ 'pulse-icon': m.thinking || m.thinkingTyping }">
+                  {{ (m.thinking || m.thinkingTyping) ? '🧠' : m.typing ? '💬' : '✓' }}
+                </span>
                 <span class="thought-title">
-                  <template v-if="m.thinking">
-                    正在深度思考与多 Agent 协同推理
+                  <template v-if="m.thinking || m.thinkingTyping">
+                    AI 深度思考推理流
                     <span class="thinking-spinner"></span>
                   </template>
+                  <template v-else-if="m.typing">
+                    AI 深度思考推理流 (推理完成 · 正在作答)
+                  </template>
                   <template v-else>
-                    已完成深度推理（共 {{ m.thoughts?.length || 0 }} 个节点步骤）
+                    AI 深度思考推理流 (全链路推理完成 · 共 {{ m.thoughts?.length || 0 }} 环节)
                   </template>
                 </span>
+                <span v-if="m.thinking || m.thinkingTyping" class="live-badge">🔴 LIVE 思考直播中</span>
+                <span v-else-if="m.typing" class="live-badge answer-badge">⚡ 实时作答中</span>
+                <span v-else class="done-badge">✓ 推理完毕</span>
               </div>
-              <button class="thought-toggle-btn" type="button">
-                {{ m.thoughtCollapsed ? '展开' : '折叠' }}
-                <span class="arrow-icon" :class="{ 'arrow-up': !m.thoughtCollapsed }">▼</span>
-              </button>
             </div>
 
-            <!-- 思考推理流水线步骤详情（展开/折叠区域） -->
-            <div v-show="!m.thoughtCollapsed" class="thought-body">
-              <ul class="thought-step-list">
-                <li
-                  v-for="(th, idx) in m.thoughts"
-                  :key="idx"
-                  class="thought-step-item"
-                  :class="th.status"
-                >
-                  <div class="step-indicator">
-                    <span v-if="th.status === 'running'" class="step-running-dot"></span>
-                    <span v-else class="step-check">✓</span>
-                  </div>
-                  <div class="step-content">
-                    <div class="step-title-line">
-                      <span class="step-title">{{ th.title }}</span>
-                      <span v-if="th.node" class="step-node-tag">{{ th.node }}</span>
-                    </div>
-                    <div v-if="th.detail" class="step-detail">
-                      <code>{{ th.detail }}</code>
-                    </div>
-                  </div>
-                </li>
-              </ul>
+            <!-- 思考推理流水线终端展示（彻底移除折叠，逐字打字机流式打印） -->
+            <div class="thought-body">
+              <pre class="thought-stream-text">{{ m.thinkingText || formatThoughtsFallback(m) }}<span v-if="m.thinking || m.thinkingTyping" class="thought-cursor">▌</span></pre>
             </div>
           </div>
 
-          <!-- 回答正文内容 -->
+          <!-- 回答正文内容（带专属标题栏与平滑打字机光标） -->
           <div class="text-content">
-            <p v-if="m.content" class="text">{{ m.content }}</p>
-            <div v-else-if="m.thinking" class="answering-placeholder">
+            <div
+              v-if="m.role === 'assistant' && (m.thinkingText || m.thoughts?.length) && (m.content || m.typing)"
+              class="answer-section-header"
+            >
+              <span class="answer-header-icon">💬</span>
+              <span class="answer-header-text">客服答复：</span>
+            </div>
+            <div v-if="m.content" class="text">
+              <span>{{ m.content }}</span>
+              <span v-if="m.typing" class="typewriter-cursor">▌</span>
+            </div>
+            <div v-else-if="m.thinking || m.thinkingTyping" class="answering-placeholder">
               <span class="typing-cursor"></span>
-              <span class="waiting-text">正在整合生成专业解答...</span>
+              <span class="waiting-text">{{ latestThinkingTitle(m) || '正在深度思考并组织作答...' }}</span>
             </div>
           </div>
 
@@ -847,44 +941,78 @@ onMounted(() => {
   font-weight: 600;
 }
 
-/* ===== 深度思考与推理过程卡片 (类似 DeepSeek / o1 风格) ===== */
+/* ===== 深度思考与推理过程卡片 (无折叠按钮，永久展开，打字机流式动效) ===== */
 .thought-card {
   background: #f8fafc;
   border: 1px solid #e2e8f0;
-  border-radius: 10px;
-  margin-bottom: 10px;
+  border-left: 4px solid #6366f1;
+  border-radius: 8px;
+  margin-bottom: 12px;
   overflow: hidden;
   transition: all 0.25s ease;
 }
 
 .thought-card.is-thinking {
   border-color: #c7d2fe;
+  border-left-color: #4f46e5;
   background: #f5f7ff;
-  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.08);
+  box-shadow: 0 2px 10px rgba(99, 102, 241, 0.08);
+}
+
+.thought-card.is-typing {
+  border-color: #e2e8f0;
+  border-left-color: #10b981;
+  background: #fbfcfe;
+}
+
+.live-badge {
+  font-size: 10px;
+  font-weight: 700;
+  color: #ef4444;
+  background: #fee2e2;
+  padding: 2px 7px;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  letter-spacing: 0.5px;
+  animation: livePulse 1.8s infinite;
+}
+
+.live-badge.answer-badge {
+  color: #2563eb;
+  background: #dbeafe;
+}
+
+.done-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: #16a34a;
+  background: #dcfce7;
+  padding: 2px 7px;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+}
+
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
 }
 
 .thought-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
-  cursor: pointer;
+  padding: 9px 14px;
+  background: rgba(241, 245, 249, 0.7);
+  border-bottom: 1px solid #e2e8f0;
   user-select: none;
-  background: rgba(241, 245, 249, 0.6);
-  border-bottom: 1px solid transparent;
-  transition: background-color 0.2s;
-}
-
-.thought-header:hover {
-  background: rgba(226, 232, 240, 0.6);
-}
-
-.thought-card:not(.is-collapsed) .thought-header {
-  border-bottom-color: #e2e8f0;
 }
 
 .thought-card.is-thinking .thought-header {
-  background: rgba(238, 242, 255, 0.7);
+  background: rgba(238, 242, 255, 0.85);
   border-bottom-color: #e0e7ff;
 }
 
@@ -894,11 +1022,11 @@ onMounted(() => {
   gap: 8px;
   font-size: 13px;
   font-weight: 600;
-  color: #475569;
+  color: #334155;
 }
 
 .thought-card.is-thinking .thought-header-left {
-  color: #4f46e5;
+  color: #4338ca;
 }
 
 .thought-icon {
@@ -933,133 +1061,51 @@ onMounted(() => {
   vertical-align: middle;
 }
 
-.thought-toggle-btn {
-  border: none;
-  background: transparent;
-  color: #64748b;
-  font-size: 12px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 8px;
-  border-radius: 4px;
-  font-weight: 500;
-}
-
-.thought-toggle-btn:hover {
-  color: #334155;
-  background: rgba(0, 0, 0, 0.05);
-}
-
-.arrow-icon {
-  font-size: 9px;
-  transition: transform 0.25s ease;
-}
-
-.arrow-up {
-  transform: rotate(180deg);
-}
-
 .thought-body {
-  padding: 10px 14px;
-  max-height: 360px;
+  padding: 12px 14px;
+  max-height: 480px;
   overflow-y: auto;
   font-size: 12.5px;
+  background: #f8fafc;
 }
 
-.thought-step-list {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.thought-step-item {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  animation: fadeIn 0.3s ease;
-}
-
-.step-indicator {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  margin-top: 2px;
-  flex-shrink: 0;
-}
-
-.step-check {
-  width: 16px;
-  height: 16px;
-  background: #10b981;
-  color: white;
-  font-size: 11px;
-  font-weight: bold;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.step-running-dot {
-  width: 13px;
-  height: 13px;
-  border: 2px solid #c7d2fe;
-  border-top-color: #4f46e5;
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-
-.step-content {
-  flex: 1;
-  min-width: 0;
-}
-
-.step-title-line {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.step-title {
-  font-weight: 600;
-  color: #1e293b;
-  font-size: 13px;
-}
-
-.step-node-tag {
-  font-size: 10px;
-  background: #e2e8f0;
-  color: #475569;
-  padding: 1px 6px;
-  border-radius: 4px;
-  font-family: monospace;
-}
-
-.step-detail {
-  margin-top: 3px;
-  color: #475569;
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.step-detail code {
-  display: inline-block;
-  background: rgba(0, 0, 0, 0.04);
-  padding: 3px 8px;
-  border-radius: 4px;
-  font-size: 11.5px;
-  word-break: break-all;
-  white-space: pre-wrap;
+.thought-stream-text {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 12.8px;
+  line-height: 1.8;
   color: #334155;
-  border: 1px solid rgba(0, 0, 0, 0.04);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  padding: 2px 0;
+  letter-spacing: 0.2px;
+}
+
+.thought-cursor {
+  display: inline-block;
+  color: #6366f1;
+  font-weight: 900;
+  font-size: 14px;
+  margin-left: 2px;
+  animation: cursorBlink 0.7s infinite;
+  user-select: none;
+  vertical-align: baseline;
+}
+
+.answer-section-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: #475569;
+  font-weight: 600;
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed #e2e8f0;
+}
+
+.answer-header-icon {
+  font-size: 13px;
 }
 
 .answering-placeholder {
@@ -1078,6 +1124,16 @@ onMounted(() => {
   background: #6366f1;
   border-radius: 1px;
   animation: cursorBlink 0.8s infinite;
+}
+
+.typewriter-cursor {
+  display: inline-block;
+  color: #4f46e5;
+  font-weight: 900;
+  margin-left: 2px;
+  animation: cursorBlink 0.7s infinite;
+  user-select: none;
+  vertical-align: baseline;
 }
 
 @keyframes cursorBlink {
