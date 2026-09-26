@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import {
   chatWithCs,
+  chatWithCsStream,
   clearCsCache,
   clearUserQaHistory,
   deleteUserQaRecord,
@@ -103,26 +104,79 @@ async function send() {
   if (!text || sending.value) return
   input.value = ''
   error.value = ''
+
+  // 1. 用户提问消息即刻入列
   messages.value.push({ role: 'user', content: text })
   sending.value = true
+
+  // 2. 助理气泡即刻入列（包含深度思考推理卡片）
+  const assistantMsg = {
+    role: 'assistant',
+    content: '',
+    agent: '',
+    mode: '',
+    trace: [],
+    thoughts: [],
+    thinking: true,
+    thoughtCollapsed: false, // 思考推理进行中：默认展开给用户实时感知
+  }
+  messages.value.push(assistantMsg)
   scrollToBottom()
+
   try {
-    const res = await chatWithCs(conversationId.value, text)
-    conversationId.value = res.conversation_id
-    messages.value.push({
-      role: 'assistant',
-      content: res.reply,
-      agent: res.agent,
-      mode: res.mode,
-      trace: res.trace || [],
+    await chatWithCsStream(conversationId.value, text, {
+      onThought: (th) => {
+        // 实时更新或追加思考与推理步骤
+        const existingIdx = assistantMsg.thoughts.findIndex((t) => t.node === th.node)
+        if (existingIdx >= 0) {
+          assistantMsg.thoughts[existingIdx] = {
+            ...assistantMsg.thoughts[existingIdx],
+            title: th.title,
+            detail: th.detail,
+            status: th.status,
+          }
+        } else {
+          assistantMsg.thoughts.push({
+            node: th.node,
+            title: th.title,
+            detail: th.detail,
+            status: th.status,
+          })
+        }
+        scrollToBottom()
+      },
+      onToken: (tok) => {
+        // 核心体验：一旦开始输出最终回答内容，自动折叠思考推理过程（保持界面整洁干练）
+        if (assistantMsg.thinking) {
+          assistantMsg.thinking = false
+          assistantMsg.thoughtCollapsed = true
+        }
+        assistantMsg.content += tok.content
+        scrollToBottom()
+      },
+      onDone: (doneEvt) => {
+        assistantMsg.thinking = false
+        assistantMsg.thoughtCollapsed = true
+        if (!assistantMsg.content && doneEvt.reply) {
+          assistantMsg.content = doneEvt.reply
+        }
+        assistantMsg.agent = doneEvt.agent
+        assistantMsg.mode = doneEvt.mode
+        assistantMsg.trace = doneEvt.trace || []
+        conversationId.value = doneEvt.conversation_id
+      },
+      onError: (errEvt) => {
+        assistantMsg.thinking = false
+        error.value = errEvt.message || '接收回复异常'
+      },
     })
   } catch (err) {
-    error.value = err.message
-    messages.value.push({
-      role: 'assistant',
-      content: '抱歉，消息发送失败，请稍后重试。',
-      failed: true,
-    })
+    assistantMsg.thinking = false
+    error.value = err.message || '消息发送失败'
+    if (!assistantMsg.content) {
+      assistantMsg.content = '抱歉，服务暂不可用，请稍后重试。'
+      assistantMsg.failed = true
+    }
   } finally {
     sending.value = false
     scrollToBottom()
@@ -328,7 +382,72 @@ onMounted(() => {
     <div ref="listEl" class="chat-list">
       <div v-for="(m, index) in messages" :key="index" class="row" :class="m.role">
         <div class="bubble">
-          <p class="text">{{ m.content }}</p>
+          <!-- 深度推理与思考过程卡片（可实时流式展开，回答完成后折叠） -->
+          <div
+            v-if="m.role === 'assistant' && (m.thoughts?.length || m.thinking)"
+            class="thought-card"
+            :class="{ 'is-thinking': m.thinking, 'is-collapsed': m.thoughtCollapsed }"
+          >
+            <div
+              class="thought-header"
+              :title="m.thoughtCollapsed ? '点击展开查看完整推理过程' : '点击折叠收起推理过程'"
+              @click="m.thoughtCollapsed = !m.thoughtCollapsed"
+            >
+              <div class="thought-header-left">
+                <span class="thought-icon" :class="{ 'pulse-icon': m.thinking }">🧠</span>
+                <span class="thought-title">
+                  <template v-if="m.thinking">
+                    正在深度思考与多 Agent 协同推理
+                    <span class="thinking-spinner"></span>
+                  </template>
+                  <template v-else>
+                    已完成深度推理（共 {{ m.thoughts?.length || 0 }} 个节点步骤）
+                  </template>
+                </span>
+              </div>
+              <button class="thought-toggle-btn" type="button">
+                {{ m.thoughtCollapsed ? '展开' : '折叠' }}
+                <span class="arrow-icon" :class="{ 'arrow-up': !m.thoughtCollapsed }">▼</span>
+              </button>
+            </div>
+
+            <!-- 思考推理流水线步骤详情（展开/折叠区域） -->
+            <div v-show="!m.thoughtCollapsed" class="thought-body">
+              <ul class="thought-step-list">
+                <li
+                  v-for="(th, idx) in m.thoughts"
+                  :key="idx"
+                  class="thought-step-item"
+                  :class="th.status"
+                >
+                  <div class="step-indicator">
+                    <span v-if="th.status === 'running'" class="step-running-dot"></span>
+                    <span v-else class="step-check">✓</span>
+                  </div>
+                  <div class="step-content">
+                    <div class="step-title-line">
+                      <span class="step-title">{{ th.title }}</span>
+                      <span v-if="th.node" class="step-node-tag">{{ th.node }}</span>
+                    </div>
+                    <div v-if="th.detail" class="step-detail">
+                      <code>{{ th.detail }}</code>
+                    </div>
+                  </div>
+                </li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- 回答正文内容 -->
+          <div class="text-content">
+            <p v-if="m.content" class="text">{{ m.content }}</p>
+            <div v-else-if="m.thinking" class="answering-placeholder">
+              <span class="typing-cursor"></span>
+              <span class="waiting-text">正在整合生成专业解答...</span>
+            </div>
+          </div>
+
+          <!-- 专员标签与模式 -->
           <div v-if="m.role === 'assistant' && (m.agent || m.mode)" class="meta-line">
             <span
               class="agent-chip"
@@ -349,6 +468,7 @@ onMounted(() => {
               {{ modeLabel(m.mode) }}
             </span>
           </div>
+
           <div v-if="m.role === 'assistant' && m.trace?.length" class="trace-block">
             <button class="trace-toggle" type="button" @click="toggleTrace(index)">
               {{ openTrace === index ? '收起' : '展开' }}调度流程（{{ m.trace.length }} 步）
@@ -357,12 +477,6 @@ onMounted(() => {
               <li v-for="(step, i) in m.trace" :key="i"><code>{{ step }}</code></li>
             </ol>
           </div>
-        </div>
-      </div>
-
-      <div v-if="sending" class="row assistant">
-        <div class="bubble typing">
-          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
         </div>
       </div>
     </div>
@@ -731,6 +845,253 @@ onMounted(() => {
   background: #f0f9ff;
   border-color: #bae6fd;
   font-weight: 600;
+}
+
+/* ===== 深度思考与推理过程卡片 (类似 DeepSeek / o1 风格) ===== */
+.thought-card {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  margin-bottom: 10px;
+  overflow: hidden;
+  transition: all 0.25s ease;
+}
+
+.thought-card.is-thinking {
+  border-color: #c7d2fe;
+  background: #f5f7ff;
+  box-shadow: 0 2px 8px rgba(99, 102, 241, 0.08);
+}
+
+.thought-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  cursor: pointer;
+  user-select: none;
+  background: rgba(241, 245, 249, 0.6);
+  border-bottom: 1px solid transparent;
+  transition: background-color 0.2s;
+}
+
+.thought-header:hover {
+  background: rgba(226, 232, 240, 0.6);
+}
+
+.thought-card:not(.is-collapsed) .thought-header {
+  border-bottom-color: #e2e8f0;
+}
+
+.thought-card.is-thinking .thought-header {
+  background: rgba(238, 242, 255, 0.7);
+  border-bottom-color: #e0e7ff;
+}
+
+.thought-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #475569;
+}
+
+.thought-card.is-thinking .thought-header-left {
+  color: #4f46e5;
+}
+
+.thought-icon {
+  font-size: 15px;
+}
+
+.pulse-icon {
+  display: inline-block;
+  animation: brainPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes brainPulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.18);
+    opacity: 0.75;
+  }
+}
+
+.thinking-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #a5b4fc;
+  border-top-color: #4f46e5;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.thought-toggle-btn {
+  border: none;
+  background: transparent;
+  color: #64748b;
+  font-size: 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.thought-toggle-btn:hover {
+  color: #334155;
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.arrow-icon {
+  font-size: 9px;
+  transition: transform 0.25s ease;
+}
+
+.arrow-up {
+  transform: rotate(180deg);
+}
+
+.thought-body {
+  padding: 10px 14px;
+  max-height: 360px;
+  overflow-y: auto;
+  font-size: 12.5px;
+}
+
+.thought-step-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.thought-step-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  animation: fadeIn 0.3s ease;
+}
+
+.step-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.step-check {
+  width: 16px;
+  height: 16px;
+  background: #10b981;
+  color: white;
+  font-size: 11px;
+  font-weight: bold;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.step-running-dot {
+  width: 13px;
+  height: 13px;
+  border: 2px solid #c7d2fe;
+  border-top-color: #4f46e5;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.step-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.step-title-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.step-title {
+  font-weight: 600;
+  color: #1e293b;
+  font-size: 13px;
+}
+
+.step-node-tag {
+  font-size: 10px;
+  background: #e2e8f0;
+  color: #475569;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: monospace;
+}
+
+.step-detail {
+  margin-top: 3px;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.step-detail code {
+  display: inline-block;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 11.5px;
+  word-break: break-all;
+  white-space: pre-wrap;
+  color: #334155;
+  border: 1px solid rgba(0, 0, 0, 0.04);
+}
+
+.answering-placeholder {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #6366f1;
+  font-size: 13px;
+  padding: 6px 0;
+}
+
+.typing-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 14px;
+  background: #6366f1;
+  border-radius: 1px;
+  animation: cursorBlink 0.8s infinite;
+}
+
+@keyframes cursorBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .typing {

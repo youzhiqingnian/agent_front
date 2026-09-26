@@ -86,13 +86,78 @@ export const submitJudge = (word, answer) =>
     body: JSON.stringify({ word, answer }),
   })
 
-// ===== 智能客服 API =====
-
 export const chatWithCs = (conversationId, message) =>
   request('/api/cs/chat', {
     method: 'POST',
     body: JSON.stringify({ conversation_id: conversationId, message }),
   })
+
+export async function chatWithCsStream(conversationId, message, { onThought, onToken, onDone, onError } = {}) {
+  const token = getLocalToken()
+  const authHeader = token ? { Authorization: `Bearer ${token}` } : {}
+
+  let response
+  try {
+    response = await fetch(`${BASE}/api/cs/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeader,
+      },
+      body: JSON.stringify({ conversation_id: conversationId, message }),
+    })
+  } catch {
+    const err = new Error('无法连接后端服务，请确认后端已启动')
+    if (onError) onError({ message: err.message })
+    throw err
+  }
+
+  if (response.status === 401) {
+    clearLocalAuth()
+    const err = new Error('登录会话已失效，请重新登录')
+    if (onError) onError({ message: err.message })
+    throw err
+  }
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    const err = new Error(body?.detail || `请求失败（HTTP ${response.status}）`)
+    if (onError) onError({ message: err.message })
+    throw err
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n\n')
+      buffer = lines.pop() || ''
+
+      for (const block of lines) {
+        const trimmed = block.trim()
+        if (!trimmed || !trimmed.startsWith('data:')) continue
+        const jsonStr = trimmed.replace(/^data:\s*/, '')
+        try {
+          const event = JSON.parse(jsonStr)
+          if (event.type === 'thought' && onThought) onThought(event)
+          else if (event.type === 'token' && onToken) onToken(event)
+          else if (event.type === 'done' && onDone) onDone(event)
+          else if (event.type === 'error' && onError) onError(event)
+        } catch (e) {
+          console.warn('Failed to parse SSE event:', e, jsonStr)
+        }
+      }
+    }
+  } catch (err) {
+    if (onError) onError({ message: err.message || '流式数据接收异常' })
+    throw err
+  }
+}
 
 export const fetchCsCacheStats = () => request('/api/cs/cache/stats')
 
