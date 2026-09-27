@@ -1,7 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import {
-  chatWithCs,
   chatWithCsStream,
   clearCsCache,
   clearUserQaHistory,

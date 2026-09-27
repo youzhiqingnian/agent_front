@@ -86,11 +86,11 @@ export const submitJudge = (word, answer) =>
     body: JSON.stringify({ word, answer }),
   })
 
-export const chatWithCs = (conversationId, message) =>
-  request('/api/cs/chat', {
-    method: 'POST',
-    body: JSON.stringify({ conversation_id: conversationId, message }),
-  })
+//export const chatWithCs = (conversationId, message) =>
+//  request('/api/cs/chat', {
+//    method: 'POST',
+//    body: JSON.stringify({ conversation_id: conversationId, message }),
+//  })
 
 export async function chatWithCsStream(conversationId, message, { onThought, onToken, onDone, onError } = {}) {
   const token = getLocalToken()
