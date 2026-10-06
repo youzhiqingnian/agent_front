@@ -96,6 +96,12 @@ export async function chatWithCsStream(conversationId, message, { onThought, onT
   const token = getLocalToken()
   const authHeader = token ? { Authorization: `Bearer ${token}` } : {}
 
+  // 前端看门狗超时（75秒），防止网络底层假死或后端彻底未响应时前端永久停留在转圈状态
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => {
+    controller.abort(new Error('响应等待超时（已达安全时限75秒），已为您自动解除挂起等待'))
+  }, 75000)
+
   let response
   try {
     response = await fetch(`${BASE}/api/cs/chat/stream`, {
@@ -105,14 +111,19 @@ export async function chatWithCsStream(conversationId, message, { onThought, onT
         ...authHeader,
       },
       body: JSON.stringify({ conversation_id: conversationId, message }),
+      signal: controller.signal,
     })
-  } catch {
-    const err = new Error('无法连接后端服务，请确认后端已启动')
-    if (onError) onError({ message: err.message })
+  } catch (fetchErr) {
+    clearTimeout(timeoutId)
+    const isTimeout = fetchErr?.name === 'AbortError' || fetchErr?.message?.includes('超时')
+    const errMsg = isTimeout ? (fetchErr.message || '响应等待超时，已自动解除等待状态') : '无法连接后端服务，请确认后端已启动'
+    const err = new Error(errMsg)
+    if (onError) onError({ message: errMsg })
     throw err
   }
 
   if (response.status === 401) {
+    clearTimeout(timeoutId)
     clearLocalAuth()
     const err = new Error('登录会话已失效，请重新登录')
     if (onError) onError({ message: err.message })
@@ -120,6 +131,7 @@ export async function chatWithCsStream(conversationId, message, { onThought, onT
   }
 
   if (!response.ok) {
+    clearTimeout(timeoutId)
     const body = await response.json().catch(() => null)
     const err = new Error(body?.detail || `请求失败（HTTP ${response.status}）`)
     if (onError) onError({ message: err.message })
@@ -148,6 +160,9 @@ export async function chatWithCsStream(conversationId, message, { onThought, onT
       else if (event.type === 'token' && onToken) onToken(event)
       else if (event.type === 'done' && onDone) onDone(event)
       else if (event.type === 'error' && onError) onError(event)
+      else if (event.type === 'ping') {
+        // 心跳探活事件：自动保持长连接活跃，静默忽略以防干扰 UI
+      }
     } catch (e) {
       console.warn('Failed to parse SSE event:', e, dataContent)
     }
@@ -169,8 +184,12 @@ export async function chatWithCsStream(conversationId, message, { onThought, onT
       processBlock(buffer)
     }
   } catch (err) {
-    if (onError) onError({ message: err.message || '流式数据接收异常' })
-    throw err
+    const isTimeout = err?.name === 'AbortError' || err?.message?.includes('超时')
+    const errMsg = isTimeout ? (err.message || '响应等待超时，已自动解除等待') : (err.message || '流式数据接收异常')
+    if (onError) onError({ message: errMsg })
+    throw new Error(errMsg)
+  } finally {
+    clearTimeout(timeoutId)
   }
 }
 
