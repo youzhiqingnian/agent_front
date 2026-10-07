@@ -1,0 +1,922 @@
+<script setup>
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { fetchCsReplayEvents, fetchCsReplayTurns, runCsGhostReplay } from '../api'
+
+const props = defineProps({
+  item: { type: Object, required: true },
+})
+const emit = defineEmits(['close'])
+
+// ===== 节点与事件的中文标题映射 =====
+const NODE_LABELS = {
+  security_check: '🛡️ 安全风控审查',
+  mem0_memory_retrieve: '🗂️ 长期记忆检索',
+  rewrite_node: '🔍 意图分析与上下文重写',
+  semantic_cache_check: '⚡ 语义缓存检索',
+  supervisor: '🧭 调度主管',
+  multi_question_coordinator: '🧩 多问题协同器',
+  text_to_sql_agent: '📊 数据查询专员',
+  sql_summary_node: '📝 数据汇总节点',
+  order_agent: '📦 订单专员',
+  product_agent: '🛒 商品专员',
+  aftersale_agent: '🔧 售后专员',
+  chitchat_agent: '💬 闲聊专员',
+  finalize: '🏁 轮次收尾',
+}
+
+const MODE_LABELS = {
+  new: '🆕 新轮次',
+  resume: '🔁 补充恢复轮',
+}
+
+function nodeLabel(node) {
+  return NODE_LABELS[node] || `⚙️ ${node}`
+}
+
+function fmtMs(ms) {
+  if (ms == null) return ''
+  const s = (ms / 1000).toFixed(1)
+  return `${s}s`
+}
+
+// ===== 状态 =====
+const turns = ref([])
+const selectedTurnId = ref('')
+const events = ref([])
+const loading = ref(false)
+const loadError = ref('')
+const playing = ref(false)
+const speed = ref(1)
+const playedMs = ref(0)
+const sourceMode = ref('recorded') // recorded | replayed
+const expandedSeq = ref(new Set())
+const timelineEl = ref(null)
+
+const ghost = ref(null)
+const ghostLoading = ref(false)
+const ghostError = ref('')
+
+let playTimer = null
+
+const totalMs = computed(() => {
+  const list = timelineEvents.value
+  if (!list.length) return 0
+  return Math.max(...list.map((e) => e.elapsed_ms ?? 0))
+})
+
+const replayDerivedEvents = computed(() => {
+  const g = ghost.value
+  if (!g || !g.replayed) return []
+  const nodes = g.replayed.nodes || []
+  const total = totalMs.value || 1
+  const derived = nodes.map((n, i) => ({
+    seq: -(i + 1),
+    type: 'node_exit',
+    node: n,
+    elapsed_ms: Math.round((total * (i + 1)) / (nodes.length + 1)),
+    synthetic: true,
+  }))
+  if (g.replayed.reply) {
+    derived.push({
+      seq: -(nodes.length + 1),
+      type: 'turn_end',
+      reply: g.replayed.reply,
+      agent: g.replayed.agent,
+      mode: g.replayed.mode,
+      elapsed_ms: total,
+      synthetic: true,
+    })
+  }
+  return derived
+})
+
+const timelineEvents = computed(() =>
+  sourceMode.value === 'replayed' ? replayDerivedEvents.value : events.value,
+)
+
+const revealedEvents = computed(() =>
+  timelineEvents.value.filter((e) => (e.elapsed_ms ?? 0) <= playedMs.value),
+)
+
+const lastRevealedSeq = computed(() => {
+  const list = revealedEvents.value
+  return list.length ? list[list.length - 1].seq : null
+})
+
+const currentTurn = computed(() =>
+  turns.value.find((t) => t.turn_id === selectedTurnId.value) || null,
+)
+
+// ===== 数据加载 =====
+async function loadTurns() {
+  loading.value = true
+  loadError.value = ''
+  try {
+    const data = await fetchCsReplayTurns(props.item.conversation_id)
+    turns.value = data.turns || []
+    if (turns.value.length) {
+      selectedTurnId.value = turns.value[turns.value.length - 1].turn_id
+      await loadEvents()
+    } else {
+      loadError.value = '该会话暂无回放记录（需先产生一轮问答）'
+    }
+  } catch (err) {
+    loadError.value = err.message || '轮次列表加载失败'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function loadEvents() {
+  if (!selectedTurnId.value) return
+  loading.value = true
+  loadError.value = ''
+  ghost.value = null
+  ghostError.value = ''
+  sourceMode.value = 'recorded'
+  expandedSeq.value = new Set()
+  stopPlayback()
+  playedMs.value = 0
+  try {
+    const data = await fetchCsReplayEvents(props.item.conversation_id, selectedTurnId.value)
+    events.value = data.events || []
+  } catch (err) {
+    events.value = []
+    loadError.value = err.message || '事件时间线加载失败'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function selectTurn(turnId) {
+  if (turnId === selectedTurnId.value) return
+  selectedTurnId.value = turnId
+  await loadEvents()
+}
+
+// ===== 时间线播放 =====
+function startPlayback() {
+  if (!timelineEvents.value.length) return
+  if (playedMs.value >= totalMs.value) playedMs.value = 0
+  playing.value = true
+  clearInterval(playTimer)
+  playTimer = setInterval(() => {
+    playedMs.value = Math.min(totalMs.value, playedMs.value + 100 * speed.value)
+    if (playedMs.value >= totalMs.value) stopPlayback()
+  }, 100)
+}
+
+function stopPlayback() {
+  playing.value = false
+  clearInterval(playTimer)
+  playTimer = null
+}
+
+function togglePlayback() {
+  if (playing.value) stopPlayback()
+  else startPlayback()
+}
+
+function stepForward() {
+  stopPlayback()
+  const next = timelineEvents.value.find((e) => (e.elapsed_ms ?? 0) > playedMs.value)
+  if (next) playedMs.value = next.elapsed_ms
+  else playedMs.value = totalMs.value
+}
+
+function resetPlayback() {
+  stopPlayback()
+  playedMs.value = 0
+}
+
+function toggleExpand(seq) {
+  const next = new Set(expandedSeq.value)
+  if (next.has(seq)) next.delete(seq)
+  else next.add(seq)
+  expandedSeq.value = next
+}
+
+function isExpanded(seq) {
+  return expandedSeq.value.has(seq)
+}
+
+function scrollToLastRevealed() {
+  nextTick(() => {
+    const el = timelineEl.value
+    if (!el) return
+    const cards = el.querySelectorAll('.rp-step.revealed')
+    if (cards.length) cards[cards.length - 1].scrollIntoView({ block: 'nearest' })
+  })
+}
+
+watch(revealedEvents, () => {
+  if (playing.value) scrollToLastRevealed()
+})
+
+// ===== 幽灵重放 =====
+async function runGhost() {
+  ghostLoading.value = true
+  ghostError.value = ''
+  ghost.value = null
+  try {
+    ghost.value = await runCsGhostReplay(props.item.conversation_id, selectedTurnId.value)
+  } catch (err) {
+    ghostError.value = err.message || '幽灵重放执行失败'
+  } finally {
+    ghostLoading.value = false
+  }
+}
+
+function useReplayedSource() {
+  sourceMode.value = 'replayed'
+  playedMs.value = 0
+  stopPlayback()
+}
+
+// ===== 事件卡渲染辅助 =====
+function eventTitle(e) {
+  switch (e.type) {
+    case 'turn_start':
+      return `${MODE_LABELS[e.mode] || '🚀 轮次开始'} · 用户提问`
+    case 'initial_state':
+      return '📦 初始状态快照'
+    case 'node_exit':
+      return nodeLabel(e.node)
+    case 'llm_start':
+      return `🤖 LLM 调用 #${e.call_index} 发起`
+    case 'llm_end':
+      return `🤖 LLM 调用 #${e.call_index} 完成`
+    case 'interrupt':
+      return '⏸️ 澄清挂起 (HIL interrupt)'
+    case 'turn_end':
+      return '✅ 轮次结束'
+    case 'turn_error':
+      return '❌ 轮次异常'
+    default:
+      return e.type
+  }
+}
+
+function prettyJson(value) {
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
+}
+
+function truncate(text, len = 240) {
+  const s = String(text ?? '')
+  return s.length > len ? `${s.slice(0, len)}…` : s
+}
+
+onMounted(loadTurns)
+onBeforeUnmount(stopPlayback)
+</script>
+
+<template>
+  <div class="replay-panel">
+    <!-- 面板头 -->
+    <div class="rp-header">
+      <div class="rp-header-left">
+        <span class="rp-badge">🎬 Agent 回放面板</span>
+        <span class="rp-sub">会话 {{ item.conversation_id }} · 确定性可重放状态机</span>
+      </div>
+      <div class="rp-header-right">
+        <button class="rp-btn ghost-btn" type="button" :disabled="!selectedTurnId || ghostLoading" @click="runGhost">
+          {{ ghostLoading ? '👻 重放中…' : '👻 幽灵重放（零 token 确定性校验）' }}
+        </button>
+        <button class="rp-btn back-btn" type="button" @click="emit('close')">← 返回</button>
+      </div>
+    </div>
+
+    <!-- 轮次选择条 -->
+    <div v-if="turns.length" class="rp-turns">
+      <button
+        v-for="t in turns"
+        :key="t.turn_id"
+        class="rp-turn-chip"
+        :class="{ active: t.turn_id === selectedTurnId }"
+        type="button"
+        :title="`${t.started_at} · ${t.user_message}`"
+        @click="selectTurn(t.turn_id)"
+      >
+        <span class="chip-time">{{ (t.started_at || '').slice(11, 19) }}</span>
+        <span class="chip-msg">{{ truncate(t.user_message, 18) }}</span>
+        <span v-if="t.interrupted" class="chip-tag warn">⏸ 挂起</span>
+        <span v-else-if="t.resume_of_turn_id" class="chip-tag">🔁 补充</span>
+      </button>
+    </div>
+
+    <!-- 幽灵重放结果 -->
+    <div v-if="ghost" class="rp-ghost-result" :class="{ consistent: ghost.consistent }">
+      <div class="ghost-summary">
+        <span class="ghost-badge" :class="ghost.consistent ? 'ok' : 'bad'">
+          {{ ghost.consistent ? '✓ 确定性一致' : '✗ 确定性发散' }}
+        </span>
+        <span class="ghost-stat">缓存命中 <b>{{ ghost.hits }}</b> / 共 {{ ghost.llm_calls }} 次 LLM 调用</span>
+        <span class="ghost-stat">未命中 <b :class="{ miss: ghost.misses > 0 }">{{ ghost.misses }}</b></span>
+        <button
+          v-if="ghost.consistent"
+          class="rp-btn replace-btn"
+          type="button"
+          @click="useReplayedSource"
+        >
+          🎞 用重放时间线替换动画数据源
+        </button>
+      </div>
+      <div v-if="ghost.diffs && ghost.diffs.length" class="ghost-diffs">
+        <div v-for="(d, i) in ghost.diffs" :key="i" class="ghost-diff">✗ {{ d }}</div>
+      </div>
+      <div v-if="ghost.consistent" class="ghost-compare">
+        <div class="compare-col">
+          <div class="compare-title">记录 (recorded)</div>
+          <pre class="compare-pre">{{ prettyJson(ghost.recorded) }}</pre>
+        </div>
+        <div class="compare-col">
+          <div class="compare-title">重放 (replayed)</div>
+          <pre class="compare-pre">{{ prettyJson(ghost.replayed) }}</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- 播放控制条 -->
+    <div v-if="timelineEvents.length" class="rp-toolbar">
+      <button class="rp-btn play-btn" type="button" @click="togglePlayback">
+        {{ playing ? '⏸ 暂停' : '▶ 播放' }}
+      </button>
+      <button class="rp-btn" type="button" @click="stepForward">⏭ 单步</button>
+      <button class="rp-btn" type="button" @click="resetPlayback">↺ 重置</button>
+      <select v-model.number="speed" class="rp-speed">
+        <option :value="0.5">0.5x</option>
+        <option :value="1">1x</option>
+        <option :value="2">2x</option>
+        <option :value="4">4x</option>
+      </select>
+      <input
+        v-model.number="playedMs"
+        class="rp-progress"
+        type="range"
+        min="0"
+        :max="totalMs"
+        step="50"
+        @input="stopPlayback"
+      >
+      <span class="rp-time">{{ fmtMs(playedMs) }} / {{ fmtMs(totalMs) }}</span>
+      <span v-if="sourceMode === 'replayed'" class="rp-source-tag">🎞 重放数据源</span>
+    </div>
+
+    <!-- 执行时间线 -->
+    <div ref="timelineEl" class="rp-timeline">
+      <div v-if="loading" class="rp-loading">⏳ 加载回放数据…</div>
+      <div v-else-if="loadError" class="rp-error">{{ loadError }}</div>
+
+      <template v-else v-for="e in revealedEvents" :key="e.seq">
+        <!-- LLM 事件卡 -->
+        <div
+          v-if="e.type === 'llm_start' || e.type === 'llm_end'"
+          class="rp-step llm-card revealed"
+          :class="{ current: e.seq === lastRevealedSeq && playing, end: e.type === 'llm_end' }"
+        >
+          <div class="rp-step-head" @click="toggleExpand(e.seq)">
+            <span class="rp-step-title">{{ eventTitle(e) }}</span>
+            <span class="rp-step-meta">
+              {{ nodeLabel(e.node) }} · {{ e.call_kind }} · {{ e.task_type }} · {{ fmtMs(e.elapsed_ms) }}
+            </span>
+            <span class="rp-expand">{{ isExpanded(e.seq) ? '▾' : '▸' }}</span>
+          </div>
+          <div v-if="isExpanded(e.seq)" class="rp-step-body">
+            <div v-if="e.type === 'llm_start'" class="rp-kv">
+              <div class="rp-kv-label">输入 (input_hash: {{ e.input_hash }})</div>
+              <pre class="rp-pre">{{ truncate(prettyJson(e.input), 900) }}</pre>
+            </div>
+            <div v-else class="rp-kv">
+              <div class="rp-kv-label">
+                输出 ({{ e.model_name || '未知模型' }})
+                <span v-if="e.error" class="rp-kv-error">· 调用异常</span>
+              </div>
+              <pre class="rp-pre">{{ truncate(e.output || e.error || '', 900) }}</pre>
+            </div>
+          </div>
+        </div>
+
+        <!-- 通用事件卡（节点/初始状态/中断/收尾） -->
+        <div
+          v-else
+          class="rp-step revealed"
+          :class="[
+            { current: e.seq === lastRevealedSeq && playing },
+            `kind-${e.type}`,
+            { synthetic: e.synthetic },
+          ]"
+        >
+          <div class="rp-step-head" @click="toggleExpand(e.seq)">
+            <span class="rp-step-title">{{ eventTitle(e) }}</span>
+            <span class="rp-step-meta">
+              <template v-if="e.type === 'node_exit'">节点完成 · {{ fmtMs(e.elapsed_ms) }}</template>
+              <template v-else-if="e.type === 'interrupt'">等待用户补充 · {{ fmtMs(e.elapsed_ms) }}</template>
+              <template v-else-if="e.type === 'turn_end'">
+                {{ e.agent }} · {{ e.mode }} · {{ fmtMs(e.elapsed_ms) }}
+              </template>
+              <template v-else>{{ fmtMs(e.elapsed_ms) }}</template>
+            </span>
+            <span class="rp-expand">{{ isExpanded(e.seq) ? '▾' : '▸' }}</span>
+          </div>
+
+          <!-- 事件正文 -->
+          <div class="rp-step-summary">
+            <template v-if="e.type === 'turn_start'">
+              <p class="rp-line">💬 {{ e.user_message }}</p>
+              <p v-if="e.resume_of_turn_id" class="rp-line subtle">溯源挂起轮: {{ e.resume_of_turn_id }}</p>
+            </template>
+            <template v-else-if="e.type === 'interrupt'">
+              <p class="rp-line">「{{ e.prompt }}」</p>
+            </template>
+            <template v-else-if="e.type === 'turn_end'">
+              <p class="rp-line">{{ truncate(e.reply, 300) }}</p>
+            </template>
+            <template v-else-if="e.type === 'turn_error'">
+              <p class="rp-line error-text">{{ e.error }}</p>
+            </template>
+            <template v-else-if="e.type === 'node_exit' && e.synthetic">
+              <p class="rp-line subtle">幽灵重放节点序列（派生事件）</p>
+            </template>
+          </div>
+
+          <div v-if="isExpanded(e.seq)" class="rp-step-body">
+            <div v-if="e.type === 'node_exit' && e.updates" class="rp-kv">
+              <div class="rp-kv-label">节点写回增量 (updates)</div>
+              <pre class="rp-pre">{{ truncate(prettyJson(e.updates), 900) }}</pre>
+            </div>
+            <div v-if="e.type === 'node_exit' && e.state_snapshot" class="rp-kv">
+              <div class="rp-kv-label">节点完成后状态快照 (state_snapshot)</div>
+              <pre class="rp-pre">{{ truncate(prettyJson(e.state_snapshot), 1400) }}</pre>
+            </div>
+            <div v-if="e.type === 'initial_state'" class="rp-kv">
+              <div class="rp-kv-label">重建轮次的初始状态（含历史 messages 与压缩记忆快照）</div>
+              <pre class="rp-pre">{{ truncate(prettyJson(e.state), 1400) }}</pre>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <div v-if="!loading && !loadError && !revealedEvents.length" class="rp-empty">
+        按「▶ 播放」或拖动进度条查看执行时间线
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.replay-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.rp-header {
+  padding: 10px 16px;
+  background: #f8fafc;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.rp-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.rp-badge {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #7c3aed;
+  background: #f5f3ff;
+  border: 1px solid #ddd6fe;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.rp-sub {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.rp-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rp-btn {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  color: #475569;
+}
+
+.rp-btn:hover {
+  background: #e2e8f0;
+  color: #1e293b;
+}
+
+.rp-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.ghost-btn {
+  background: #f5f3ff;
+  border: 1px solid #ddd6fe;
+  color: #6d28d9;
+  font-weight: 600;
+}
+
+.ghost-btn:hover {
+  background: #ede9fe;
+}
+
+.back-btn {
+  font-weight: 600;
+}
+
+/* 轮次选择条 */
+.rp-turns {
+  display: flex;
+  gap: 6px;
+  padding: 8px 16px;
+  border-bottom: 1px solid #e2e8f0;
+  overflow-x: auto;
+  background: #fff;
+}
+
+.rp-turn-chip {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  color: #334155;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.rp-turn-chip:hover {
+  border-color: #c4b5fd;
+}
+
+.rp-turn-chip.active {
+  background: #f5f3ff;
+  border-color: #8b5cf6;
+  color: #5b21b6;
+  font-weight: 600;
+}
+
+.chip-time {
+  color: #94a3b8;
+}
+
+.chip-tag {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: #ecfdf5;
+  color: #047857;
+}
+
+.chip-tag.warn {
+  background: #fef3c7;
+  color: #b45309;
+}
+
+/* 幽灵重放结果 */
+.rp-ghost-result {
+  margin: 10px 16px 0;
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.rp-ghost-result.consistent {
+  border-color: #a7f3d0;
+  background: #ecfdf5;
+}
+
+.ghost-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ghost-badge {
+  font-size: 13px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 6px;
+}
+
+.ghost-badge.ok {
+  background: #10b981;
+  color: #fff;
+}
+
+.ghost-badge.bad {
+  background: #ef4444;
+  color: #fff;
+}
+
+.ghost-stat {
+  font-size: 12px;
+  color: #334155;
+}
+
+.ghost-stat b {
+  color: #047857;
+}
+
+.ghost-stat b.miss {
+  color: #dc2626;
+}
+
+.replace-btn {
+  margin-left: auto;
+  background: #fff;
+  border-color: #a7f3d0;
+  color: #047857;
+}
+
+.ghost-diffs {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ghost-diff {
+  font-size: 12px;
+  color: #b91c1c;
+}
+
+.ghost-compare {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.compare-col {
+  min-width: 0;
+}
+
+.compare-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #334155;
+  margin-bottom: 4px;
+}
+
+.compare-pre {
+  font-size: 11px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 6px 8px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 播放控制条 */
+.rp-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #fff;
+}
+
+.play-btn {
+  background: #7c3aed;
+  border-color: #7c3aed;
+  color: #fff;
+  font-weight: 600;
+}
+
+.play-btn:hover {
+  background: #6d28d9;
+  color: #fff;
+}
+
+.rp-speed {
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  color: #334155;
+}
+
+.rp-progress {
+  flex: 1;
+  min-width: 80px;
+  accent-color: #7c3aed;
+}
+
+.rp-time {
+  font-size: 12px;
+  color: #64748b;
+  font-variant-numeric: tabular-nums;
+}
+
+.rp-source-tag {
+  font-size: 11px;
+  color: #7c3aed;
+  background: #f5f3ff;
+  border: 1px solid #ddd6fe;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+/* 时间线 */
+.rp-timeline {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.rp-loading,
+.rp-error,
+.rp-empty {
+  font-size: 13px;
+  color: #64748b;
+  text-align: center;
+  padding: 30px 0;
+}
+
+.rp-error {
+  color: #dc2626;
+}
+
+.rp-step {
+  border: 1px solid #e2e8f0;
+  border-left: 3px solid #94a3b8;
+  border-radius: 10px;
+  background: #fff;
+  padding: 8px 12px;
+  animation: rp-fade-in 0.25s ease;
+}
+
+@keyframes rp-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.rp-step.kind-turn_start {
+  border-left-color: #3b82f6;
+}
+
+.rp-step.kind-node_exit {
+  border-left-color: #8b5cf6;
+}
+
+.rp-step.kind-interrupt {
+  border-left-color: #f59e0b;
+  background: #fffbeb;
+}
+
+.rp-step.kind-turn_end {
+  border-left-color: #10b981;
+  background: #f0fdf4;
+}
+
+.rp-step.kind-turn_error {
+  border-left-color: #ef4444;
+  background: #fef2f2;
+}
+
+.rp-step.kind-initial_state {
+  border-left-color: #06b6d4;
+}
+
+.rp-step.synthetic {
+  border-left-style: dashed;
+  background: #faf5ff;
+}
+
+.rp-step.current {
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.35);
+}
+
+.rp-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+
+.rp-step-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+.rp-step-meta {
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.rp-expand {
+  margin-left: auto;
+  font-size: 11px;
+  color: #94a3b8;
+}
+
+.rp-step-summary {
+  margin-top: 4px;
+}
+
+.rp-line {
+  font-size: 12.5px;
+  color: #334155;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.rp-line.subtle {
+  color: #94a3b8;
+  font-size: 11.5px;
+}
+
+.rp-line.error-text {
+  color: #dc2626;
+}
+
+.rp-step-body {
+  margin-top: 8px;
+  border-top: 1px dashed #e2e8f0;
+  padding-top: 8px;
+}
+
+.rp-kv {
+  margin-bottom: 8px;
+}
+
+.rp-kv:last-child {
+  margin-bottom: 0;
+}
+
+.rp-kv-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: #64748b;
+  margin-bottom: 4px;
+}
+
+.rp-kv-error {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.rp-pre {
+  font-size: 11px;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #334155;
+}
+</style>

@@ -308,3 +308,16 @@ export const fetchUserOrders = (userId, orderStatus) => {
 
 export const fetchOrderDetail = (orderNo) => request(`/api/ecommerce/orders/${encodeURIComponent(orderNo)}`)
 
+// ===== Agent 回放系统 API =====
+
+export const fetchCsReplayTurns = (conversationId) =>
+  request(`/api/cs/replay/${encodeURIComponent(conversationId)}/turns`)
+
+export const fetchCsReplayEvents = (conversationId, turnId) =>
+  request(`/api/cs/replay/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(turnId)}/events`)
+
+export const runCsGhostReplay = (conversationId, turnId) =>
+  request(`/api/cs/replay/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(turnId)}/ghost`, {
+    method: 'POST',
+  })
+

@@ -10,6 +10,7 @@ import {
   fetchUserQaSessions,
 } from '../api'
 import { authStore } from '../store/auth'
+import ReplayPanel from './ReplayPanel.vue'
 
 const STORAGE_KEY = 'cs-chat-session'
 
@@ -50,6 +51,8 @@ const historyLoading = ref(false)
 const historyRecords = ref([])
 const historyTotal = ref(0)
 const guestHistoryRecords = ref([])
+// 回放面板数据源（非空时主面板切换为 Agent 回放视图）
+const replayItem = ref(null)
 
 const canSend = computed(() => !sending.value)
 
@@ -134,17 +137,30 @@ function resetSession() {
   localStorage.removeItem(STORAGE_KEY)
   conversationId.value = ''
   messages.value = greeting()
+  replayItem.value = null
   selectedHistoryId.value = null
   error.value = ''
 }
 
 // 选择左侧的历史问题，在右侧展示答案与全链路推理过程
 function selectHistoryItem(item) {
+  replayItem.value = null
   selectedHistoryId.value = item.id
+}
+
+// 打开 Agent 回放面板（幽灵重放 + 执行时间线）
+function openReplay(item) {
+  replayItem.value = item
+}
+
+// 关闭回放面板，回到历史详情
+function closeReplay() {
+  replayItem.value = null
 }
 
 // 开始提新问题，切回实时交互对话流
 function startNewQuestion() {
+  replayItem.value = null
   selectedHistoryId.value = null
   input.value = ''
   nextTick(() => {
@@ -154,6 +170,7 @@ function startNewQuestion() {
 
 // 从历史详情返回实时对话视图
 function returnToLiveChat() {
+  replayItem.value = null
   selectedHistoryId.value = null
   nextTick(() => {
     scrollToBottom()
@@ -162,6 +179,7 @@ function returnToLiveChat() {
 
 // 基于历史问题继续追问
 function handleFollowUp(item) {
+  replayItem.value = null
   conversationId.value = item.conversation_id || conversationId.value
   input.value = `关于“${item.question}”：`
   selectedHistoryId.value = null
@@ -817,14 +835,24 @@ onMounted(() => {
 
       <!-- ===== 右侧：主交互/答案展示与全链路推理详情面板 ===== -->
       <main class="cs-main-panel">
-        <!-- 模式 A：点击左侧历史提问，展示该提问的问题、全链路中间推理过程与解答 -->
-        <div v-if="selectedHistoryItem" class="history-detail-wrapper">
+        <!-- 模式 A：Agent 回放面板（执行时间线 + 幽灵重放确定性校验） -->
+        <ReplayPanel
+          v-if="replayItem"
+          :item="replayItem"
+          @close="closeReplay"
+        />
+
+        <!-- 模式 B：点击左侧历史提问，展示该提问的问题、全链路中间推理过程与解答 -->
+        <div v-else-if="selectedHistoryItem" class="history-detail-wrapper">
           <div class="history-detail-header">
             <div class="detail-header-left">
               <span class="detail-badge">📌 历史问答详情</span>
               <span class="detail-time">🕒 提问时间: {{ selectedHistoryItem.created_at }}</span>
             </div>
             <div class="detail-header-right">
+              <button class="detail-action-btn replay-btn" type="button" @click="openReplay(selectedHistoryItem)">
+                ▶ 回放
+              </button>
               <button class="detail-action-btn followup-btn" type="button" @click="handleFollowUp(selectedHistoryItem)">
                 💬 基于此问题追问
               </button>
@@ -1490,6 +1518,17 @@ onMounted(() => {
 
 .followup-btn:hover {
   background: #dbeafe;
+}
+
+.replay-btn {
+  background: #f5f3ff;
+  border: 1px solid #ddd6fe;
+  color: #6d28d9;
+  font-weight: 600;
+}
+
+.replay-btn:hover {
+  background: #ede9fe;
 }
 
 .back-btn {
