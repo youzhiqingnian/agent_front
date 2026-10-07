@@ -1,19 +1,27 @@
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import {
+  abandonCsTask,
+  attachCsTaskStream,
   chatWithCsStream,
   clearCsCache,
   clearUserQaHistory,
   deleteUserQaRecord,
   fetchAdminUsers,
   fetchCsCacheStats,
+  fetchCsTask,
+  fetchPendingCsTasks,
   fetchUserQaHistory,
   fetchUserQaSessions,
+  resumeCsTask,
 } from '../api'
+import { createTypewriter, stagesToThinkingText } from '../composables/useTypewriterStream'
 import { authStore } from '../store/auth'
 import ReplayPanel from './ReplayPanel.vue'
+import ResumeTaskModal from './ResumeTaskModal.vue'
 
 const STORAGE_KEY = 'cs-chat-session'
+const TASK_KEY = 'cs-chat-inflight-task'
 
 const AGENT_LABELS = {
   text_to_sql_agent: '📊 数据查询专员',
@@ -43,7 +51,14 @@ const composing = ref(false)
 const error = ref('')
 const listEl = ref(null)
 
-let activeTypewriterTimer = null
+// 本轮的本地连接与打字机：关页面只断开它们，后端任务照常跑完
+let currentStream = null
+let currentTypewriter = null
+let localDetach = false
+
+// 需要用户裁决的中断任务（弹窗数据源）
+const pendingTask = ref(null)
+const showResumeModal = ref(false)
 
 // ===== 历史提问列表与查看状态 =====
 const selectedHistoryId = ref(null)
@@ -106,12 +121,31 @@ function greeting() {
   ]
 }
 
+const TRANSIENT_FLAGS = ['thinking', 'thinkingTyping', 'typing']
+
+// 瞬时状态只属于正在跑的那条连接，持久化后重开就会永久卡在「思考直播中」
+function stripTransient(message) {
+  if (!TRANSIENT_FLAGS.some((flag) => message[flag])) return message
+  const clean = { ...message }
+  TRANSIENT_FLAGS.forEach((flag) => {
+    clean[flag] = false
+  })
+  clean.staleStream = true
+  clean.interruptedNote = clean.interruptedNote || '⏸ 上次任务在此中断'
+  return clean
+}
+
+function persistableMessages() {
+  return messages.value.map(stripTransient)
+}
+
 function loadSession() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null')
     if (saved && Array.isArray(saved.messages) && saved.messages.length) {
       conversationId.value = saved.conversationId || ''
-      messages.value = saved.messages
+      // 双保险：容忍改动前留下的脏数据
+      messages.value = saved.messages.map(stripTransient)
       return
     }
   } catch {
@@ -120,19 +154,54 @@ function loadSession() {
   messages.value = greeting()
 }
 
+function readInflight() {
+  try {
+    return JSON.parse(localStorage.getItem(TASK_KEY) || 'null')
+  } catch {
+    return null
+  }
+}
+
+function writeInflight(patch) {
+  try {
+    const base = readInflight() || {}
+    const next = { ...base, ...patch }
+    if (!next.runId) next.runId = base.runId || ''
+    if (!next.runId) return
+    next.conversationId = conversationId.value || base.conversationId || ''
+    localStorage.setItem(TASK_KEY, JSON.stringify(next))
+  } catch {
+    // 忽略异常
+  }
+}
+
+function clearInflight() {
+  try {
+    localStorage.removeItem(TASK_KEY)
+  } catch {
+    // 忽略异常
+  }
+}
+
 let saveSessionTimer = null
+function saveSessionNow() {
+  if (saveSessionTimer) {
+    clearTimeout(saveSessionTimer)
+    saveSessionTimer = null
+  }
+  try {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ conversationId: conversationId.value, messages: persistableMessages() }),
+    )
+  } catch {
+    // 忽略异常
+  }
+}
+
 function saveSession() {
   if (saveSessionTimer) clearTimeout(saveSessionTimer)
-  saveSessionTimer = setTimeout(() => {
-    try {
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({ conversationId: conversationId.value, messages: messages.value }),
-      )
-    } catch {
-      // 忽略异常
-    }
-  }, 300)
+  saveSessionTimer = setTimeout(saveSessionNow, 300)
 }
 
 function scrollToBottom() {
@@ -143,10 +212,14 @@ function scrollToBottom() {
 }
 
 function resetSession() {
-  if (activeTypewriterTimer) {
-    clearInterval(activeTypewriterTimer)
-    activeTypewriterTimer = null
+  detachLocalStream()
+  if (currentTypewriter) {
+    currentTypewriter.stop()
+    currentTypewriter = null
   }
+  clearInflight()
+  pendingTask.value = null
+  showResumeModal.value = false
   localStorage.removeItem(STORAGE_KEY)
   conversationId.value = ''
   messages.value = greeting()
@@ -350,24 +423,9 @@ function formatHistoryReasoningText(item) {
   return steps.map((s) => `${s.icon} ${s.title} — ${s.detail}`).join('\n')
 }
 
-// 核心流式提问处理函数
-async function send() {
-  const text = input.value.trim()
-  if (!text || sending.value) return
-  input.value = ''
-  error.value = ''
-
-  // 若此前处于历史详情查看状态，自动切回实时问答流
-  if (selectedHistoryId.value !== null) {
-    selectedHistoryId.value = null
-  }
-
-  // 1. 用户提问消息即刻入列
-  messages.value.push({ role: 'user', content: text })
-  sending.value = true
-
-  // 2. 助理气泡即刻入列（使用 reactive 确保打字机高频修改时 Vue 响应式驱动 DOM 实时逐字渲染）
-  const assistantMsg = reactive({
+function newAssistantBubble() {
+  // reactive 保证打字机高频改字段时 Vue 能驱动 DOM 实时逐字渲染
+  return reactive({
     role: 'assistant',
     content: '',
     agent: '',
@@ -379,204 +437,315 @@ async function send() {
     thinkingTyping: true,
     typing: false,
   })
+}
+
+/** 一轮问答收尾：把提问与全链路推理同步到左侧历史列表顶端。 */
+function applyTurnDone(doneEvt, question, fallbackAnswer = '') {
+  conversationId.value = doneEvt.conversation_id
+  const newRecord = {
+    id: Date.now(),
+    conversation_id: doneEvt.conversation_id,
+    question,
+    answer: doneEvt.reply || fallbackAnswer,
+    agent: doneEvt.agent,
+    mode: doneEvt.mode,
+    trace: doneEvt.trace || [],
+    trace_summary: Array.isArray(doneEvt.trace) ? doneEvt.trace.join(' -> ') : '',
+    created_at: new Date().toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-'),
+  }
+  historyRecords.value.unshift(newRecord)
+  guestHistoryRecords.value.unshift(newRecord)
+  historyTotal.value++
+}
+
+async function send() {
+  const text = input.value.trim()
+  if (!text || sending.value) return
+  input.value = ''
+  await ask(text)
+}
+
+async function ask(text) {
+  // 若此前处于历史详情查看状态，自动切回实时问答流
+  if (selectedHistoryId.value !== null) {
+    selectedHistoryId.value = null
+  }
+  error.value = ''
+
+  messages.value.push({ role: 'user', content: text })
+  sending.value = true
+  const assistantMsg = newAssistantBubble()
   messages.value.push(assistantMsg)
   scrollToBottom()
 
-  // 全链路双轨打字机队列：思考推理流先出，作答正文紧随其后逐字输出 (12ms 高频时钟)
-  let thoughtCharBuffer = ''
-  let tokenBuffer = ''
-  let typewriterTimer = null
-  let isStreamDone = false
-  let pendingDoneEvt = null
-  let hasStartedAnswering = false
-
-  const nowFormatted = new Date().toLocaleString('zh-CN', { hour12: false }).replace(/\//g, '-')
-
-  // 0ms 零延迟即刻装载首批工作流推理步骤，打字机立刻启动向外蹦字
-  thoughtCharBuffer += '▸ 🚀 正在启动智能客服 Agent 思考流... — 初始化多智能体协同流水线与会话上下文\n'
-  thoughtCharBuffer += '▸ 🛡️ 正在进行输入安全风控审查... — 检测提示词注入、角色越狱与指令合规性\n'
-  assistantMsg.thoughts.push({
-    node: 'workflow_start',
-    title: '🚀 正在启动智能客服 Agent 思考流...',
-    detail: '初始化多智能体协同流水线与会话上下文',
-    status: 'done',
+  const tw = createTypewriter(assistantMsg, {
+    scrollToBottom,
+    onDone: (evt) => applyTurnDone(evt, text, assistantMsg.content),
+    onError: (evt) => {
+      error.value = evt.message || '接收回复异常'
+      offerResume(tw.runId)
+    },
   })
-  assistantMsg.thoughts.push({
-    node: 'security_check',
-    title: '🛡️ 正在进行输入安全风控审查...',
-    detail: '检测提示词注入、角色越狱与指令合规性',
-    status: 'running',
-  })
+  // 0ms 零延迟装载首批推理步骤，打字机立刻启动向外蹦字
+  tw.seedOpening()
 
-  const flushTypewriter = () => {
-    let hasWork = false
+  await runStream(chatWithCsStream(conversationId.value, text, trackingHandlers(tw)), tw, assistantMsg)
+}
 
-    // 1. 思考推理流打字机（思考流严格先于回答正文完成打字）
-    if (thoughtCharBuffer.length > 0) {
-      hasWork = true
-      const speedBoost = (!hasStartedAnswering && tokenBuffer.length > 0) ? 2 : 1
-      const step = thoughtCharBuffer.length > 45 ? (3 * speedBoost) : thoughtCharBuffer.length > 15 ? (2 * speedBoost) : 1
-      const chars = thoughtCharBuffer.slice(0, step)
-      thoughtCharBuffer = thoughtCharBuffer.slice(step)
-      assistantMsg.thinkingText += chars
-      assistantMsg.thinkingTyping = true
-    } else {
-      assistantMsg.thinkingTyping = false
-    }
-
-    // 2. 思考流当前环节排空后，开启作答阶段并驱动回答正文打字机
-    if (thoughtCharBuffer.length === 0 && tokenBuffer.length > 0) {
-      hasStartedAnswering = true
-    }
-
-    if (hasStartedAnswering && tokenBuffer.length > 0) {
-      hasWork = true
-      if (assistantMsg.thinking) {
-        assistantMsg.thinking = false
+/** task 首帧带着 run_id：第一时间写进 localStorage，浏览器被硬杀也还能认回这条任务。 */
+function trackingHandlers(tw) {
+  return {
+    ...tw.handlers,
+    onTask: (evt) => {
+      tw.handlers.onTask(evt)
+      // cid 原本要等 done 才落地，中断恰恰意味着没有 done：这里就得把它锚下来
+      if (evt.conversation_id && !conversationId.value) {
+        conversationId.value = evt.conversation_id
       }
-      assistantMsg.typing = true
-      const step = tokenBuffer.length > 50 ? 3 : tokenBuffer.length > 20 ? 2 : 1
-      const chars = tokenBuffer.slice(0, step)
-      tokenBuffer = tokenBuffer.slice(step)
-      assistantMsg.content += chars
-    }
-
-    if (hasWork) {
-      scrollToBottom()
-    } else if (isStreamDone && thoughtCharBuffer.length === 0 && tokenBuffer.length === 0) {
-      // 全链路流式彻底结束且所有打字队列完全排空
-      if (typewriterTimer) {
-        clearInterval(typewriterTimer)
-        typewriterTimer = null
-      }
-      activeTypewriterTimer = null
-      assistantMsg.thinkingTyping = false
-      assistantMsg.typing = false
-      assistantMsg.thinking = false
-      if (!assistantMsg.content && pendingDoneEvt?.reply) {
-        assistantMsg.content = pendingDoneEvt.reply
-      }
-      scrollToBottom()
-    }
+      writeInflight({ runId: evt.run_id, lastSeq: -1 })
+    },
   }
+}
 
-  const startTypewriter = () => {
-    if (!typewriterTimer) {
-      typewriterTimer = setInterval(flushTypewriter, 12)
-      activeTypewriterTimer = typewriterTimer
-    }
+/** 关标签/切走 tab：只断本地连接并留住游标，不发任何「通知后端我走了」的请求。 */
+function detachLocalStream() {
+  if (currentTypewriter) {
+    writeInflight({ runId: currentTypewriter.runId, lastSeq: currentTypewriter.lastSeq })
   }
+  // 流式期间防抖永远不会到点，断开这一刻必须同步把半截内容存下来
+  saveSessionNow()
+  if (currentStream) {
+    localDetach = true
+    currentStream.abort()
+    currentStream = null
+  }
+}
 
-  // 0ms 即刻触发首屏打字机运行
-  startTypewriter()
-
+/**
+ * 统一收尾：读尽或本地断开都只影响这一条连接，后端任务照常跑完并落库。
+ * 收到过 done 就清掉在途游标；否则留住 {runId,lastSeq} 供下次续流。
+ */
+async function runStream(stream, tw, msg) {
+  currentStream = stream
+  currentTypewriter = tw
+  let handled = false
   try {
-    await chatWithCsStream(conversationId.value, text, {
-      onThought: (th) => {
-        const existingIdx = assistantMsg.thoughts.findIndex((t) => t.node === th.node)
-        if (existingIdx >= 0) {
-          assistantMsg.thoughts[existingIdx] = {
-            ...assistantMsg.thoughts[existingIdx],
-            title: th.title,
-            detail: th.detail,
-            status: th.status,
-          }
-        } else {
-          assistantMsg.thoughts.push({
-            node: th.node,
-            title: th.title,
-            detail: th.detail,
-            status: th.status,
-          })
-        }
-
-        if (th.node === 'workflow_start') {
-          return
-        }
-
-        if (th.node === 'security_check') {
-          if (th.status === 'done') {
-            thoughtCharBuffer += `✓ 🛡️ 输入安全审查通过 — ${th.detail || '输入合规无注入与越狱风险，放行至 Agent 智能工作流'}\n`
-            startTypewriter()
-            scrollToBottom()
-          } else if (th.title?.includes('拦截') || th.detail?.includes('拦截')) {
-            thoughtCharBuffer += `⚠️ 🛡️ 拦截提示词注入/越狱风险 — ${th.detail}\n`
-            startTypewriter()
-            scrollToBottom()
-          }
-          return
-        }
-
-        const marker = th.status === 'running' ? '▸' : '✓'
-        const detailText = th.detail ? ` — ${th.detail}` : ''
-        const line = `${marker} ${th.title}${detailText}\n`
-        thoughtCharBuffer += line
-
-        startTypewriter()
-        scrollToBottom()
-      },
-      onToken: (tok) => {
-        tokenBuffer += tok.content
-        startTypewriter()
-      },
-      onDone: (doneEvt) => {
-        isStreamDone = true
-        pendingDoneEvt = doneEvt
-        assistantMsg.agent = doneEvt.agent
-        assistantMsg.mode = doneEvt.mode
-        assistantMsg.trace = doneEvt.trace || []
-        conversationId.value = doneEvt.conversation_id
-        startTypewriter()
-
-        // 立即将新提问与全链路推理记录同步至左侧历史列表顶端（标注问问题的时间）
-        const newRecord = {
-          id: Date.now(),
-          conversation_id: doneEvt.conversation_id,
-          question: text,
-          answer: doneEvt.reply || assistantMsg.content,
-          agent: doneEvt.agent,
-          mode: doneEvt.mode,
-          trace: doneEvt.trace || [],
-          trace_summary: Array.isArray(doneEvt.trace) ? doneEvt.trace.join(' -> ') : '',
-          created_at: nowFormatted,
-        }
-        historyRecords.value.unshift(newRecord)
-        guestHistoryRecords.value.unshift(newRecord)
-        historyTotal.value++
-      },
-      onError: (errEvt) => {
-        assistantMsg.thinking = false
-        assistantMsg.thinkingTyping = false
-        assistantMsg.typing = false
-        if (typewriterTimer) {
-          clearInterval(typewriterTimer)
-          typewriterTimer = null
-        }
-        activeTypewriterTimer = null
-        error.value = errEvt.message || '接收回复异常'
-      },
-    })
+    await stream.promise
   } catch (err) {
-    assistantMsg.thinking = false
-    assistantMsg.thinkingTyping = false
-    assistantMsg.typing = false
-    if (typewriterTimer) {
-      clearInterval(typewriterTimer)
-      typewriterTimer = null
+    handled = true
+    tw.stop()
+    msg.thinking = false
+    if (localDetach) {
+      // 是我们自己关标签/切 tab 断的连接，后端照常在跑：不算失败，也不打中断标记
+      localDetach = false
+      msg.interruptedNote = ''
+      return
     }
-    activeTypewriterTimer = null
+    if (err.status === 409 && err.attachable_run_id) {
+      // 同会话已有任务在跑：不重复发问，直接接回那条流
+      error.value = err.message || '这个会话还有任务在执行中，已为您接回实时进度'
+      const index = messages.value.indexOf(msg)
+      if (index >= 0) messages.value.splice(index, 1)
+      const item = await fetchCsTask(err.attachable_run_id).catch(() => null)
+      if (item) await attachRun(item)
+      return
+    }
     error.value = err.message || '消息发送失败'
-    if (!assistantMsg.content) {
-      assistantMsg.content = '抱歉，服务暂不可用，请稍后重试。'
-      assistantMsg.failed = true
+    if (!msg.content) {
+      msg.content = '抱歉，服务暂不可用，请稍后重试。'
+      msg.failed = true
     }
   } finally {
     sending.value = false
+    currentStream = null
+    currentTypewriter = null
+    if (tw.isSettled()) clearInflight()
+    else {
+      writeInflight({ runId: tw.runId, lastSeq: tw.lastSeq })
+      if (!handled) {
+        // 连接自己结束了却没等到 done：气泡落定并留住游标，下次打开照样能续跑
+        tw.abandon('⏸ 这条回答的连接已中断，任务进度会在下次打开时自动核对')
+        offerResume(tw.runId)
+      }
+    }
     scrollToBottom()
     refreshCacheStats()
     if (authStore.isAuthenticated.value) {
       loadHistoryData()
     }
+  }
+}
+
+function toThoughts(stages) {
+  return (stages || []).map((s) => ({ node: s.node, title: s.title, detail: s.detail, status: s.status }))
+}
+
+/** 续流/回填前先备好气泡：优先复用那个被本地断开留下的半截气泡，避免多出一条重复问答。 */
+function ensureBubbleForTask(item) {
+  const last = messages.value[messages.value.length - 1]
+  // 本地断开时通常已打出几个字，只判空会漏认这个气泡，于是又多推一条重复提问
+  if (last && last.role === 'assistant' && (last.runId === item.run_id || last.staleStream || !last.content)) {
+    last.thinking = true
+    last.thinkingTyping = true
+    last.typing = false
+    last.staleStream = false
+    last.interruptedNote = ''
+    return last
+  }
+  const tail = messages.value[messages.value.length - 1]
+  if (!tail || tail.role !== 'user' || tail.content !== item.question) {
+    messages.value.push({ role: 'user', content: item.question })
+  }
+  const msg = newAssistantBubble()
+  messages.value.push(msg)
+  return msg
+}
+
+/** A 路径：任务仍在后端跑，从 last_seq 之后接回实时流，零重跑、不弹窗。 */
+async function attachRun(item) {
+  const msg = ensureBubbleForTask(item)
+  const tw = createTypewriter(msg, {
+    scrollToBottom,
+    onDone: (evt) => applyTurnDone(evt, item.question, msg.content),
+    onError: () => offerResume(item.run_id),
+  })
+  if (!msg.thinkingText) {
+    tw.hydrate({
+      runId: item.run_id,
+      lastSeq: item.last_seq,
+      thinkingText: stagesToThinkingText(item.stages),
+      content: item.partial_answer,
+      thoughts: toThoughts(item.stages),
+    })
+  }
+  scrollToBottom()
+  sending.value = true
+  await runStream(attachCsTaskStream(item.run_id, item.last_seq, trackingHandlers(tw)), tw, msg)
+}
+
+function fillBubbleFromTask(item, note) {
+  const msg = ensureBubbleForTask(item)
+  msg.thinking = false
+  msg.thinkingTyping = false
+  msg.typing = false
+  msg.thinkingText = stagesToThinkingText(item.stages)
+  msg.thoughts = toThoughts(item.stages)
+  if (item.partial_answer) msg.content = item.partial_answer
+  msg.interruptedNote = note
+  scrollToBottom()
+}
+
+/**
+ * 重开页面/切回本 tab 时的分层探测：
+ * 仍在跑→自动续流；等补充→沿用澄清输入；真中断→才弹窗让用户裁决。
+ * 探测本身失败一律静默，恢复接口不得影响正常问答。
+ */
+async function probeInterruptedTask() {
+  if (sending.value || currentStream) return
+  const local = readInflight()
+  const cid = conversationId.value || local?.conversationId || ''
+  // 登录用户后端按 user_id 就能兜住任务，只有 runId 也必须放行探测
+  if (!cid && !local?.runId) return
+  let payload = null
+  try {
+    payload = await fetchPendingCsTasks(cid)
+  } catch {
+    return
+  }
+  if (!payload?.tracking_available) {
+    clearInflight()
+    return
+  }
+  const item = (payload.items || [])[0]
+  if (!item) {
+    clearInflight()
+    return
+  }
+  if (item.effective_status === 'running') {
+    if (item.attachable) {
+      await attachRun(item)
+      return
+    }
+    // 执行体在别的进程里，本进程接不到实时流：回填进度，不做假续流
+    fillBubbleFromTask(item, '⏳ 任务仍在后端执行中，稍后可刷新查看结果')
+    clearInflight()
+    return
+  }
+  if (item.effective_status === 'waiting_user') {
+    // HIL 挂起不是中断：直接输入补充信息就会继续，不该弹中断窗
+    fillBubbleFromTask(item, '❓ 正在等待您补充信息，直接在下方输入即可继续')
+    return
+  }
+  if (item.effective_status === 'interrupted') {
+    pendingTask.value = item
+    showResumeModal.value = true
+    return
+  }
+  error.value = item.interrupt_text || item.unresumable_reason || '上次任务已失败'
+  fillBubbleFromTask(item, `✕ 任务已失败：${item.unresumable_reason || '现场不可恢复'}`)
+  clearInflight()
+}
+
+async function offerResume(runId) {
+  if (!runId || showResumeModal.value) return
+  const item = await fetchCsTask(runId).catch(() => null)
+  if (item && item.effective_status === 'interrupted') {
+    pendingTask.value = item
+    showResumeModal.value = true
+  }
+}
+
+async function continueInterrupted() {
+  const item = pendingTask.value
+  pendingTask.value = null
+  showResumeModal.value = false
+  if (!item) return
+  try {
+    await resumeCsTask(item.run_id, 'continue')
+  } catch (err) {
+    if (err.status === 409) {
+      // 已被别处接走或正在跑：转成续流，多端体验自然收敛
+      await attachRun(item)
+      return
+    }
+    error.value = err.message || '从断点继续执行失败'
+    return
+  }
+  await attachRun(item)
+}
+
+async function restartInterrupted() {
+  const item = pendingTask.value
+  pendingTask.value = null
+  showResumeModal.value = false
+  if (!item) return
+  clearInflight()
+  await resumeCsTask(item.run_id, 'restart').catch(() => null)
+  const last = messages.value[messages.value.length - 1]
+  if (last && last.role === 'assistant' && (last.staleStream || !last.content)) {
+    messages.value.pop()
+  }
+  await ask(item.question)
+}
+
+async function abandonInterrupted() {
+  const item = pendingTask.value
+  pendingTask.value = null
+  showResumeModal.value = false
+  if (!item) return
+  clearInflight()
+  try {
+    await abandonCsTask(item.run_id)
+  } catch (err) {
+    error.value = err.message || '放弃任务失败'
+    return
+  }
+  const last = messages.value[messages.value.length - 1]
+  if (last && last.role === 'assistant') {
+    last.thinking = false
+    last.thinkingTyping = false
+    last.typing = false
+    last.interruptedNote = '✕ 已放弃这次任务'
   }
 }
 
@@ -737,6 +906,18 @@ onMounted(() => {
     loadHistoryData()
     loadAdminUsers()
   }
+  probeInterruptedTask()
+  window.addEventListener('pagehide', detachLocalStream)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('pagehide', detachLocalStream)
+  detachLocalStream()
+  if (currentTypewriter) {
+    currentTypewriter.stop()
+    currentTypewriter = null
+  }
+  if (saveSessionTimer) clearTimeout(saveSessionTimer)
 })
 </script>
 
@@ -1024,7 +1205,14 @@ onMounted(() => {
                   <span>{{ m.content }}</span>
                   <span v-if="m.typing" class="typewriter-cursor">▌</span>
                 </div>
-                <div v-else-if="m.thinking || m.thinkingTyping" class="answering-placeholder">
+                <div v-if="m.abandonedContent" class="abandoned-answer">
+                  <div class="abandoned-label">⏸ 中断前已输出（本次续跑已作废，不与新答案拼接）</div>
+                  <div class="text">{{ m.abandonedContent }}</div>
+                </div>
+                <div
+                  v-if="!m.content && (m.thinking || m.thinkingTyping) && !m.staleStream"
+                  class="answering-placeholder"
+                >
                   <span class="typing-cursor"></span>
                   <span class="waiting-text">{{ latestThinkingTitle(m) || '正在深度思考并组织作答...' }}</span>
                 </div>
@@ -1051,6 +1239,7 @@ onMounted(() => {
                   {{ modeLabel(m.mode) }}
                 </span>
               </div>
+              <div v-if="m.interruptedNote" class="interrupted-note">{{ m.interruptedNote }}</div>
             </div>
           </div>
         </div>
@@ -1098,6 +1287,14 @@ onMounted(() => {
         </div>
       </main>
     </div>
+
+    <ResumeTaskModal
+      v-if="showResumeModal && pendingTask"
+      :task="pendingTask"
+      @continue="continueInterrupted"
+      @restart="restartInterrupted"
+      @abandon="abandonInterrupted"
+    />
   </section>
 </template>
 
@@ -1766,6 +1963,30 @@ onMounted(() => {
   align-items: center;
   gap: 6px;
   margin-top: 8px;
+}
+
+.interrupted-note {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--warn);
+}
+
+.abandoned-answer {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--line);
+  background: #f8fafc;
+  border-radius: 6px;
+}
+
+.abandoned-label {
+  font-size: 12px;
+  color: var(--ink-soft);
+  margin-bottom: 4px;
+}
+
+.abandoned-answer .text {
+  color: var(--ink-soft);
 }
 
 .agent-chip {

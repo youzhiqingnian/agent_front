@@ -1,3 +1,5 @@
+import { openCsStream } from './sse'
+
 const BASE = import.meta.env.VITE_API_BASE ?? ''
 
 export const TOKEN_STORAGE_KEY = 'yasifanyi_access_token'
@@ -45,9 +47,23 @@ async function request(path, options = {}) {
 
   if (!response.ok) {
     const body = await response.json().catch(() => null)
-    throw new Error(body?.detail || `请求失败（HTTP ${response.status}）`)
+    const detail = body?.detail
+    const fallback = `请求失败（HTTP ${response.status}）`
+    const error = new Error(
+      (detail && typeof detail === 'object' ? detail.message || detail.reason : null) ||
+        detail ||
+        fallback
+    )
+    if (detail && typeof detail === 'object') Object.assign(error, detail)
+    error.status = response.status
+    throw error
   }
   return response.json()
+}
+
+function authHeaders(extra = {}) {
+  const token = getLocalToken()
+  return { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...extra }
 }
 
 // ===== 用户认证 (Auth) API =====
@@ -86,111 +102,52 @@ export const submitJudge = (word, answer) =>
     body: JSON.stringify({ word, answer }),
   })
 
-//export const chatWithCs = (conversationId, message) =>
-//  request('/api/cs/chat', {
-//    method: 'POST',
-//    body: JSON.stringify({ conversation_id: conversationId, message }),
-//  })
+// ===== 客服流式问答与中断恢复 API =====
 
-export async function chatWithCsStream(conversationId, message, { onThought, onToken, onDone, onError } = {}) {
-  const token = getLocalToken()
-  const authHeader = token ? { Authorization: `Bearer ${token}` } : {}
-
-  // 前端看门狗超时（75秒），防止网络底层假死或后端彻底未响应时前端永久停留在转圈状态
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => {
-    controller.abort(new Error('响应等待超时（已达安全时限75秒），已为您自动解除挂起等待'))
-  }, 75000)
-
-  let response
-  try {
-    response = await fetch(`${BASE}/api/cs/chat/stream`, {
+/**
+ * 发起一轮流式问答，返回 { promise, abort }。
+ * abort() 只断开本地连接——后端任务照常跑完并落库，重开页面用 attachCsTaskStream 接回。
+ */
+export function chatWithCsStream(conversationId, message, handlers = {}) {
+  return openCsStream(
+    `${BASE}/api/cs/chat/stream`,
+    {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...authHeader,
-      },
-      body: JSON.stringify({ conversation_id: conversationId, message }),
-      signal: controller.signal,
-    })
-  } catch (fetchErr) {
-    clearTimeout(timeoutId)
-    const isTimeout = fetchErr?.name === 'AbortError' || fetchErr?.message?.includes('超时')
-    const errMsg = isTimeout ? (fetchErr.message || '响应等待超时，已自动解除等待状态') : '无法连接后端服务，请确认后端已启动'
-    const err = new Error(errMsg)
-    if (onError) onError({ message: errMsg })
-    throw err
-  }
+      body: { conversation_id: conversationId, message },
+      headers: authHeaders(),
+      onUnauthorized: clearLocalAuth,
+    },
+    handlers
+  )
+}
 
-  if (response.status === 401) {
-    clearTimeout(timeoutId)
-    clearLocalAuth()
-    const err = new Error('登录会话已失效，请重新登录')
-    if (onError) onError({ message: err.message })
-    throw err
-  }
+/** 该会话有没有没收尾的任务；追踪不可用时 tracking_available=false，前端退回旧交互。 */
+export const fetchPendingCsTasks = (conversationId) => {
+  const query = new URLSearchParams()
+  if (conversationId) query.append('conversation_id', conversationId)
+  const qs = query.toString() ? `?${query.toString()}` : ''
+  return request(`/api/cs/tasks/pending${qs}`)
+}
 
-  if (!response.ok) {
-    clearTimeout(timeoutId)
-    const body = await response.json().catch(() => null)
-    const err = new Error(body?.detail || `请求失败（HTTP ${response.status}）`)
-    if (onError) onError({ message: err.message })
-    throw err
-  }
+export const fetchCsTask = (runId) => request(`/api/cs/tasks/${encodeURIComponent(runId)}`)
 
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buffer = ''
+/** 用户在弹窗里明确选择后才调用：continue=断点续跑，restart=放弃现场重新提问。 */
+export const resumeCsTask = (runId, action = 'continue') =>
+  request(`/api/cs/tasks/${encodeURIComponent(runId)}/resume`, {
+    method: 'POST',
+    body: JSON.stringify({ action, confirm: true }),
+  })
 
-  const processBlock = (block) => {
-    const trimmed = block.trim()
-    if (!trimmed) return
-    const lines = trimmed.split(/\r?\n/)
-    let dataContent = ''
-    for (const line of lines) {
-      if (line.startsWith('data:')) {
-        const chunk = line.replace(/^data:\s?/, '')
-        dataContent += (dataContent ? '\n' : '') + chunk
-      }
-    }
-    if (!dataContent) return
-    try {
-      const event = JSON.parse(dataContent)
-      if (event.type === 'thought' && onThought) onThought(event)
-      else if (event.type === 'token' && onToken) onToken(event)
-      else if (event.type === 'done' && onDone) onDone(event)
-      else if (event.type === 'error' && onError) onError(event)
-      else if (event.type === 'ping') {
-        // 心跳探活事件：自动保持长连接活跃，静默忽略以防干扰 UI
-      }
-    } catch (e) {
-      console.warn('Failed to parse SSE event:', e, dataContent)
-    }
-  }
+export const abandonCsTask = (runId) =>
+  request(`/api/cs/tasks/${encodeURIComponent(runId)}/abandon`, { method: 'POST' })
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const blocks = buffer.split(/\r?\n\r?\n/)
-      buffer = blocks.pop() || ''
-
-      for (const block of blocks) {
-        processBlock(block)
-      }
-    }
-    if (buffer.trim()) {
-      processBlock(buffer)
-    }
-  } catch (err) {
-    const isTimeout = err?.name === 'AbortError' || err?.message?.includes('超时')
-    const errMsg = isTimeout ? (err.message || '响应等待超时，已自动解除等待') : (err.message || '流式数据接收异常')
-    if (onError) onError({ message: errMsg })
-    throw new Error(errMsg)
-  } finally {
-    clearTimeout(timeoutId)
-  }
+/** 接回任务的实时流：只下发 afterSeq 之后的事件，重连不会重复。 */
+export function attachCsTaskStream(runId, afterSeq = -1, handlers = {}) {
+  return openCsStream(
+    `${BASE}/api/cs/tasks/${encodeURIComponent(runId)}/stream?after_seq=${encodeURIComponent(afterSeq)}`,
+    { method: 'GET', headers: authHeaders(), runId, afterSeq, onUnauthorized: clearLocalAuth },
+    handlers
+  )
 }
 
 export const fetchCsCacheStats = () => request('/api/cs/cache/stats')
