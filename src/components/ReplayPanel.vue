@@ -1,6 +1,12 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { fetchCsReplayEvents, fetchCsReplayTurns, runCsGhostReplay } from '../api'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import {
+  fetchCsReplayEvents,
+  fetchCsReplayModels,
+  fetchCsReplayTurns,
+  runCsGhostReplay,
+  runCsReplayFork,
+} from '../api'
 
 const props = defineProps({
   item: { type: Object, required: true },
@@ -48,13 +54,27 @@ const loadError = ref('')
 const playing = ref(false)
 const speed = ref(1)
 const playedMs = ref(0)
-const sourceMode = ref('recorded') // recorded | replayed
+const sourceMode = ref('recorded') // recorded | replayed | forked
 const expandedSeq = ref(new Set())
 const timelineEl = ref(null)
+const forkPanelEl = ref(null)
 
 const ghost = ref(null)
 const ghostLoading = ref(false)
 const ghostError = ref('')
+
+// ===== 条件重放（调试分叉）状态 =====
+const models = ref([])
+const forkBoundary = ref(null) // 记录 node_exit 序列的 0-based 起点；null=未选择
+const forkConfig = reactive({
+  model_override: '',
+  temperature_override: '',
+  prompt_override: '',
+  user_message_override: '',
+})
+const forkBusy = ref(false)
+const forkError = ref('')
+const fork = ref(null)
 
 let playTimer = null
 
@@ -90,9 +110,70 @@ const replayDerivedEvents = computed(() => {
   return derived
 })
 
-const timelineEvents = computed(() =>
-  sourceMode.value === 'replayed' ? replayDerivedEvents.value : events.value,
+const forkDerivedEvents = computed(() => {
+  const f = fork.value
+  if (!f || !f.forked) return []
+  const nodes = f.forked.nodes || []
+  const total = totalMs.value || 1
+  const derived = nodes.map((n, i) => ({
+    seq: -(i + 1),
+    type: 'node_exit',
+    node: n,
+    elapsed_ms: Math.round((total * (i + 1)) / (nodes.length + 1)),
+    synthetic: true,
+  }))
+  if (f.forked.reply) {
+    derived.push({
+      seq: -(nodes.length + 1),
+      type: 'turn_end',
+      reply: f.forked.reply,
+      agent: f.forked.agent,
+      mode: f.forked.mode,
+      elapsed_ms: total,
+      synthetic: true,
+    })
+  }
+  return derived
+})
+
+const timelineEvents = computed(() => {
+  if (sourceMode.value === 'replayed') return replayDerivedEvents.value
+  if (sourceMode.value === 'forked') return forkDerivedEvents.value
+  return events.value
+})
+
+// 记录时间线中的节点序列（带 0-based 序号，用于分叉起点选择）
+const recordedNodeExits = computed(() =>
+  (events.value || [])
+    .filter((e) => e.type === 'node_exit' && !e.synthetic)
+    .map((e, i) => ({ ...e, node_index: i })),
 )
+
+function nodeExitIndex(seq) {
+  const idx = recordedNodeExits.value.findIndex((e) => e.seq === seq)
+  return idx >= 0 ? idx : null
+}
+
+const boundaryOptions = computed(() => {
+  const opts = recordedNodeExits.value.map((e) => ({
+    value: e.node_index,
+    label: nodeLabel(e.node),
+  }))
+  opts.push({ value: recordedNodeExits.value.length, label: '末尾 · 全缓存快进' })
+  return opts
+})
+
+const boundaryNodeName = computed(() => {
+  if (forkBoundary.value === null) return ''
+  const exit = recordedNodeExits.value[forkBoundary.value]
+  return exit ? exit.node : ''
+})
+
+const forkBoundaryLabel = computed(() => {
+  if (forkBoundary.value === null) return '未选择'
+  if (forkBoundary.value >= recordedNodeExits.value.length) return '末尾 · 全缓存快进'
+  return nodeLabel(boundaryNodeName.value)
+})
 
 const revealedEvents = computed(() =>
   timelineEvents.value.filter((e) => (e.elapsed_ms ?? 0) <= playedMs.value),
@@ -133,6 +214,13 @@ async function loadEvents() {
   loadError.value = ''
   ghost.value = null
   ghostError.value = ''
+  fork.value = null
+  forkError.value = ''
+  forkBoundary.value = null
+  forkConfig.model_override = ''
+  forkConfig.temperature_override = ''
+  forkConfig.prompt_override = ''
+  forkConfig.user_message_override = ''
   sourceMode.value = 'recorded'
   expandedSeq.value = new Set()
   stopPlayback()
@@ -233,6 +321,61 @@ function useReplayedSource() {
   stopPlayback()
 }
 
+// ===== 条件重放（调试分叉） =====
+async function loadModels() {
+  try {
+    const res = await fetchCsReplayModels()
+    models.value = res.items || []
+  } catch (err) {
+    console.error('获取回放模型清单失败:', err)
+  }
+}
+
+function pickBoundary(index) {
+  forkBoundary.value = index
+  fork.value = null
+  forkError.value = ''
+  nextTick(() => {
+    const el = forkPanelEl.value
+    if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  })
+}
+
+async function runFork() {
+  if (forkBoundary.value === null) {
+    forkError.value = '请先选择分叉起点：点击节点卡上的「🔀 从这步重跑」或在下拉框中选择'
+    return
+  }
+  forkBusy.value = true
+  forkError.value = ''
+  fork.value = null
+  try {
+    const payload = { start_node_index: forkBoundary.value }
+    if (forkConfig.model_override) payload.model_override = forkConfig.model_override
+    const temp = Number(forkConfig.temperature_override)
+    if (forkConfig.temperature_override !== '' && Number.isFinite(temp) && temp > 0) {
+      payload.temperature_override = temp
+    }
+    if (forkConfig.user_message_override.trim()) {
+      payload.user_message_override = forkConfig.user_message_override.trim()
+    }
+    if (boundaryNodeName.value && forkConfig.prompt_override.trim()) {
+      payload.system_prompt_overrides = { [boundaryNodeName.value]: forkConfig.prompt_override.trim() }
+    }
+    fork.value = await runCsReplayFork(props.item.conversation_id, selectedTurnId.value, payload)
+  } catch (err) {
+    forkError.value = err.message || '条件重放执行失败'
+  } finally {
+    forkBusy.value = false
+  }
+}
+
+function useForkedSource() {
+  sourceMode.value = 'forked'
+  playedMs.value = 0
+  stopPlayback()
+}
+
 // ===== 事件卡渲染辅助 =====
 function eventTitle(e) {
   switch (e.type) {
@@ -270,7 +413,10 @@ function truncate(text, len = 240) {
   return s.length > len ? `${s.slice(0, len)}…` : s
 }
 
-onMounted(loadTurns)
+onMounted(() => {
+  loadTurns()
+  loadModels()
+})
 onBeforeUnmount(stopPlayback)
 </script>
 
@@ -340,6 +486,115 @@ onBeforeUnmount(stopPlayback)
       </div>
     </div>
 
+    <!-- 条件重放（调试分叉）配置面板 -->
+    <div ref="forkPanelEl" class="rp-fork-config">
+      <div class="fork-config-title">
+        🔀 条件重放 · 调试分叉
+        <span class="fork-boundary-tag">起点: {{ forkBoundaryLabel }}</span>
+      </div>
+      <div class="fork-config-grid">
+        <label class="fork-field">
+          <span class="fork-field-label">分叉起点（节点序列第几步起真实推理）</span>
+          <select v-model.number="forkBoundary" class="fork-input">
+            <option :value="null" disabled>请选择起点…</option>
+            <option v-for="opt in boundaryOptions" :key="opt.value" :value="opt.value">
+              第 {{ opt.value }} 步 · {{ opt.label }}
+            </option>
+          </select>
+        </label>
+        <label class="fork-field">
+          <span class="fork-field-label">覆盖大模型</span>
+          <select v-model="forkConfig.model_override" class="fork-input">
+            <option value="">不覆盖（默认降级链）</option>
+            <option v-for="m in models" :key="m.name" :value="m.name">
+              {{ m.name }}{{ m.is_primary ? ' · 主力' : '' }}{{ m.has_key ? '' : ' · 未配密钥' }}
+            </option>
+          </select>
+        </label>
+        <label class="fork-field">
+          <span class="fork-field-label">覆盖 temperature（留空不覆盖，0-2）</span>
+          <input
+            v-model="forkConfig.temperature_override"
+            class="fork-input"
+            type="number"
+            min="0.01"
+            max="2"
+            step="0.1"
+            placeholder="留空不覆盖"
+          >
+        </label>
+        <label class="fork-field fork-field-wide">
+          <span class="fork-field-label">
+            边界节点 system 提示词覆盖（作用于「{{ forkBoundaryLabel }}」；末尾全缓存时无效）
+          </span>
+          <textarea
+            v-model="forkConfig.prompt_override"
+            class="fork-input fork-textarea"
+            rows="2"
+            :disabled="boundaryNodeName === ''"
+            placeholder="例如：你是调度主管，请把问题分派给售后专员，并只用一句话回复。"
+          ></textarea>
+        </label>
+        <label class="fork-field fork-field-wide">
+          <span class="fork-field-label">替换用户提问（填写后强制从头全 live 重跑）</span>
+          <input
+            v-model="forkConfig.user_message_override"
+            class="fork-input"
+            type="text"
+            placeholder="留空使用原始提问"
+          >
+        </label>
+      </div>
+      <div class="fork-config-actions">
+        <button class="rp-btn fork-run-btn" type="button" :disabled="forkBusy || !selectedTurnId" @click="runFork">
+          {{ forkBusy ? '🔀 分叉推理中…（边界后真实调用 LLM）' : '🔀 运行条件重放' }}
+        </button>
+        <span class="fork-hint">边界前零 token 缓存快进 · 边界后真实调用 LLM / Redis / MySQL / mem0</span>
+      </div>
+      <p v-if="forkError" class="rp-error fork-error">{{ forkError }}</p>
+    </div>
+
+    <!-- 条件重放结果：记录 vs 分叉 -->
+    <div v-if="fork" class="rp-fork-result">
+      <div class="fork-summary">
+        <span class="fork-badge" :class="fork.error ? 'bad' : fork.diffs.length ? 'diverged' : 'ok'">
+          {{ fork.error ? '✗ 分叉执行异常' : fork.diffs.length ? '🔀 分叉完成（与记录存在差异）' : '🔀 分叉完成（与记录一致）' }}
+        </span>
+        <span class="ghost-stat">
+          边界: <b>{{ fork.boundary_node }}</b>（第 {{ fork.start_node_index }} 步）
+        </span>
+        <span class="ghost-stat">真实模型: <b>{{ fork.live_model }}</b></span>
+        <span class="ghost-stat">
+          LLM 调用 <b>{{ fork.llm_calls }}</b> 次
+          · 缓存快进 <b>{{ fork.cached_calls }}</b>
+          · 真实推理 <b :class="{ miss: fork.live_calls > 0 }">{{ fork.live_calls }}</b>
+        </span>
+        <button
+          v-if="!fork.error && fork.forked && fork.forked.nodes && fork.forked.nodes.length"
+          class="rp-btn replace-btn"
+          type="button"
+          @click="useForkedSource"
+        >
+          🎞 用分叉时间线替换动画数据源
+        </button>
+      </div>
+      <p v-if="fork.error" class="rp-line error-text fork-result-error">{{ fork.error }}</p>
+      <div v-if="fork.diffs && fork.diffs.length" class="fork-diffs">
+        <div class="fork-diffs-note">⚠️ 分叉差异属预期：这正是更换条件后的调试产物</div>
+        <div v-for="(d, i) in fork.diffs" :key="i" class="ghost-diff">✗ {{ d }}</div>
+      </div>
+      <div v-if="fork.recorded && fork.forked" class="ghost-compare">
+        <div class="compare-col">
+          <div class="compare-title">记录 (recorded)</div>
+          <pre class="compare-pre">{{ prettyJson(fork.recorded) }}</pre>
+        </div>
+        <div class="compare-col">
+          <div class="compare-title">分叉 (forked)</div>
+          <pre class="compare-pre">{{ prettyJson(fork.forked) }}</pre>
+        </div>
+      </div>
+    </div>
+
     <!-- 播放控制条 -->
     <div v-if="timelineEvents.length" class="rp-toolbar">
       <button class="rp-btn play-btn" type="button" @click="togglePlayback">
@@ -364,6 +619,7 @@ onBeforeUnmount(stopPlayback)
       >
       <span class="rp-time">{{ fmtMs(playedMs) }} / {{ fmtMs(totalMs) }}</span>
       <span v-if="sourceMode === 'replayed'" class="rp-source-tag">🎞 重放数据源</span>
+      <span v-if="sourceMode === 'forked'" class="rp-source-tag fork">🔀 分叉数据源</span>
     </div>
 
     <!-- 执行时间线 -->
@@ -420,6 +676,15 @@ onBeforeUnmount(stopPlayback)
               </template>
               <template v-else>{{ fmtMs(e.elapsed_ms) }}</template>
             </span>
+            <button
+              v-if="e.type === 'node_exit' && !e.synthetic && nodeExitIndex(e.seq) !== null"
+              class="rp-btn fork-step-btn"
+              type="button"
+              :title="`从节点序列第 ${nodeExitIndex(e.seq)} 步起，按新条件重新推理`"
+              @click.stop="pickBoundary(nodeExitIndex(e.seq))"
+            >
+              🔀 从这步重跑
+            </button>
             <span class="rp-expand">{{ isExpanded(e.seq) ? '▾' : '▸' }}</span>
           </div>
 
@@ -439,7 +704,9 @@ onBeforeUnmount(stopPlayback)
               <p class="rp-line error-text">{{ e.error }}</p>
             </template>
             <template v-else-if="e.type === 'node_exit' && e.synthetic">
-              <p class="rp-line subtle">幽灵重放节点序列（派生事件）</p>
+              <p class="rp-line subtle">
+                {{ sourceMode === 'forked' ? '条件重放节点序列（分叉派生事件）' : '幽灵重放节点序列（派生事件）' }}
+              </p>
             </template>
           </div>
 
@@ -752,6 +1019,190 @@ onBeforeUnmount(stopPlayback)
   border: 1px solid #ddd6fe;
   padding: 1px 6px;
   border-radius: 4px;
+}
+
+.rp-source-tag.fork {
+  color: #b45309;
+  background: #fffbeb;
+  border-color: #fde68a;
+}
+
+/* ===== 条件重放（调试分叉）配置面板 ===== */
+.rp-fork-config {
+  margin: 10px 16px 0;
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fork-config-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #92400e;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fork-boundary-tag {
+  font-size: 11px;
+  font-weight: 600;
+  color: #b45309;
+  background: #fef3c7;
+  border: 1px solid #fde68a;
+  padding: 1px 8px;
+  border-radius: 999px;
+}
+
+.fork-config-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.fork-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.fork-field-wide {
+  grid-column: 1 / -1;
+}
+
+.fork-field-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #92400e;
+}
+
+.fork-input {
+  font-size: 12px;
+  padding: 5px 8px;
+  border: 1px solid #fde68a;
+  border-radius: 6px;
+  background: #fff;
+  color: #1e293b;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.fork-input:focus {
+  border-color: #f59e0b;
+}
+
+.fork-input:disabled {
+  background: #fef3c7;
+  color: #a8a29e;
+  cursor: not-allowed;
+}
+
+.fork-textarea {
+  resize: vertical;
+  font-family: inherit;
+  line-height: 1.5;
+}
+
+.fork-config-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.fork-run-btn {
+  background: #f59e0b;
+  border-color: #f59e0b;
+  color: #fff;
+  font-weight: 700;
+}
+
+.fork-run-btn:hover {
+  background: #d97706;
+  color: #fff;
+}
+
+.fork-hint {
+  font-size: 11px;
+  color: #a16207;
+}
+
+.fork-error {
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+/* ===== 条件重放结果 ===== */
+.rp-fork-result {
+  margin: 10px 16px 0;
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.fork-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.fork-badge {
+  font-size: 13px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 6px;
+  color: #fff;
+}
+
+.fork-badge.ok {
+  background: #10b981;
+}
+
+.fork-badge.diverged {
+  background: #f59e0b;
+}
+
+.fork-badge.bad {
+  background: #ef4444;
+}
+
+.fork-diffs {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.fork-diffs-note {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #b45309;
+}
+
+.fork-result-error {
+  margin-top: 8px;
+}
+
+/* 节点卡上的「从这步重跑」按钮 */
+.fork-step-btn {
+  background: #fffbeb;
+  border-color: #fde68a;
+  color: #b45309;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.fork-step-btn:hover {
+  background: #fef3c7;
+  color: #92400e;
 }
 
 /* 时间线 */

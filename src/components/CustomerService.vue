@@ -5,6 +5,7 @@ import {
   clearCsCache,
   clearUserQaHistory,
   deleteUserQaRecord,
+  fetchAdminUsers,
   fetchCsCacheStats,
   fetchUserQaHistory,
   fetchUserQaSessions,
@@ -55,6 +56,18 @@ const guestHistoryRecords = ref([])
 const replayItem = ref(null)
 
 const canSend = computed(() => !sending.value)
+
+// 是否管理员（回放权限 + 跨用户历史查看）
+const isAdmin = computed(() => authStore.currentUser.value?.role === 'admin')
+
+// 管理员跨用户查看：用户列表与当前目标用户（'' 表示查看自己的历史）
+const adminUsers = ref([])
+const viewingUserId = ref('')
+
+// 当前是否正在查看其他用户的历史（隐藏删除/清空等本人专属操作）
+const viewingOthers = computed(
+  () => isAdmin.value && viewingUserId.value !== '' && String(viewingUserId.value) !== String(authStore.currentUser.value?.id),
+)
 
 // 整合历史列表（登录用户以数据库隔离存储为主，访客使用临时内存记录）
 const allHistoryRecords = computed(() => {
@@ -595,14 +608,32 @@ async function loadHistoryData() {
   try {
     const res = await fetchUserQaHistory({
       keyword: historySearchKeyword.value.trim(),
+      user_id: viewingUserId.value,
     })
     historyRecords.value = res.items || []
     historyTotal.value = res.total || 0
   } catch (err) {
-    console.error('获取个人历史问答失败:', err)
+    console.error('获取历史问答失败:', err)
   } finally {
     historyLoading.value = false
   }
+}
+
+async function loadAdminUsers() {
+  if (!isAdmin.value) return
+  try {
+    const res = await fetchAdminUsers()
+    adminUsers.value = res.items || []
+  } catch (err) {
+    console.error('获取用户列表失败:', err)
+  }
+}
+
+async function handleViewingUserChange() {
+  // 切换查看目标用户后重新拉取对应历史（管理员跨用户）
+  selectedHistoryId.value = null
+  replayItem.value = null
+  await loadHistoryData()
 }
 
 async function handleDeleteHistoryItem(id) {
@@ -687,9 +718,12 @@ watch(
   (isAuth) => {
     if (isAuth) {
       loadHistoryData()
+      loadAdminUsers()
     } else {
       historyRecords.value = []
       historyTotal.value = 0
+      adminUsers.value = []
+      viewingUserId.value = ''
     }
   },
   { immediate: true },
@@ -701,6 +735,7 @@ onMounted(() => {
   refreshCacheStats()
   if (authStore.isAuthenticated.value) {
     loadHistoryData()
+    loadAdminUsers()
   }
 })
 </script>
@@ -777,6 +812,21 @@ onMounted(() => {
               ✕
             </button>
           </div>
+
+          <!-- 管理员：跨用户历史选择器 -->
+          <div v-if="isAdmin" class="admin-user-picker">
+            <span class="admin-user-label">👁 查看用户</span>
+            <select v-model="viewingUserId" class="admin-user-select" @change="handleViewingUserChange">
+              <option value="">我的历史</option>
+              <option
+                v-for="u in adminUsers"
+                :key="u.id"
+                :value="String(u.id)"
+              >
+                {{ u.username }}{{ u.nickname && u.nickname !== u.username ? `（${u.nickname}）` : '' }}
+              </option>
+            </select>
+          </div>
         </div>
 
         <!-- 历史问题卡片列表 -->
@@ -799,6 +849,7 @@ onMounted(() => {
                 🕒 {{ item.created_at || '刚刚' }}
               </span>
               <button
+                v-if="!viewingOthers"
                 class="history-item-delete"
                 type="button"
                 title="删除此条问答记录"
@@ -825,8 +876,8 @@ onMounted(() => {
           </div>
         </div>
 
-        <!-- 底部快捷工具 -->
-        <div v-if="authStore.isAuthenticated.value && historyTotal > 0" class="sidebar-footer">
+        <!-- 底部快捷工具（仅本人历史可用清空） -->
+        <div v-if="authStore.isAuthenticated.value && historyTotal > 0 && !viewingOthers" class="sidebar-footer">
           <button class="clear-all-link" type="button" @click="handleClearAllUserHistory">
             🗑️ 清空所有提问记录
           </button>
@@ -850,7 +901,12 @@ onMounted(() => {
               <span class="detail-time">🕒 提问时间: {{ selectedHistoryItem.created_at }}</span>
             </div>
             <div class="detail-header-right">
-              <button class="detail-action-btn replay-btn" type="button" @click="openReplay(selectedHistoryItem)">
+              <button
+                v-if="isAdmin"
+                class="detail-action-btn replay-btn"
+                type="button"
+                @click="openReplay(selectedHistoryItem)"
+              >
                 ▶ 回放
               </button>
               <button class="detail-action-btn followup-btn" type="button" @click="handleFollowUp(selectedHistoryItem)">
@@ -1276,6 +1332,38 @@ onMounted(() => {
   font-size: 12px;
   cursor: pointer;
   padding: 0;
+}
+
+.admin-user-picker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.admin-user-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #6d28d9;
+  white-space: nowrap;
+}
+
+.admin-user-select {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  font-size: 12.5px;
+  color: #1e293b;
+  border: 1px solid #ddd6fe;
+  border-radius: 8px;
+  outline: none;
+  background: #f5f3ff;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.admin-user-select:focus {
+  border-color: #8b5cf6;
+  background: #ffffff;
 }
 
 .sidebar-list {

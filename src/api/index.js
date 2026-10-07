@@ -200,18 +200,24 @@ export const clearCsCache = () =>
     method: 'POST',
   })
 
-// 用户问答历史 API (按登录账号隔离)
+// 用户问答历史 API (按登录账号隔离；管理员可带 user_id 跨用户查看)
 export const fetchUserQaHistory = (params = {}) => {
   const query = new URLSearchParams()
   if (params.conversation_id) query.append('conversation_id', params.conversation_id)
   if (params.keyword) query.append('keyword', params.keyword)
   if (params.limit) query.append('limit', params.limit)
   if (params.offset) query.append('offset', params.offset)
+  if (params.user_id !== undefined && params.user_id !== null && params.user_id !== '') {
+    query.append('user_id', params.user_id)
+  }
   const qs = query.toString() ? `?${query.toString()}` : ''
   return request(`/api/cs/history${qs}`)
 }
 
-export const fetchUserQaSessions = () => request('/api/cs/sessions')
+export const fetchUserQaSessions = (userId) => {
+  const qs = userId ? `?user_id=${userId}` : ''
+  return request(`/api/cs/sessions${qs}`)
+}
 
 export const deleteUserQaRecord = (recordId) =>
   request(`/api/cs/history/${recordId}`, {
@@ -320,4 +326,14 @@ export const runCsGhostReplay = (conversationId, turnId) =>
   request(`/api/cs/replay/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(turnId)}/ghost`, {
     method: 'POST',
   })
+
+export const runCsReplayFork = (conversationId, turnId, payload) =>
+  request(`/api/cs/replay/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(turnId)}/fork`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+
+export const fetchCsReplayModels = () => request('/api/cs/replay/models')
+
+export const fetchAdminUsers = () => request('/api/auth/users')
 
